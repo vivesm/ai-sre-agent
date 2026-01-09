@@ -1,0 +1,88 @@
+# AI SRE Agent Configuration
+# /home/melvin/server/ai-sre-agent/config/config.yaml
+
+agent:
+  name: "Atom SRE Agent"
+  check_interval: 300  # 5 minutes
+  dry_run: true  # Start in dry-run mode for safety
+
+llm:
+  # Uses Claude Code CLI (already installed and authenticated)
+  provider: claude-code-cli
+  command: claude
+  timeout: 120  # seconds
+  # model: claude-sonnet-4-20250514  # Optional: specify model
+
+collectors:
+  docker:
+    enabled: true
+    log_lines: 100
+    error_only: true
+
+  system:
+    enabled: true
+    disk_threshold: 85  # Warn at 85% disk usage
+    memory_threshold: 90  # Warn at 90% memory usage
+    load_threshold: null  # Auto-detect based on CPU count
+
+  logs:
+    enabled: true
+    lookback_minutes: 30
+    paths:
+      - /var/log/container-health.log
+      - /var/log/ring-alarm-monitor.log
+      - /var/log/mqtt-health.log
+    journal_units: []
+    error_patterns:
+      - error
+      - Error
+      - ERROR
+      - failed
+      - Failed
+      - FAILED
+      - critical
+      - Critical
+      - CRITICAL
+
+notifications:
+  email:
+    enabled: true
+    smtp_host: localhost
+    smtp_port: 2525
+    from: alerts@vives.io
+    to: melvin.vives@gmail.com
+
+  mobile_push:
+    enabled: true
+    ha_url: https://home.vives.io
+    ha_token_env: HA_TOKEN  # Environment variable containing HA long-lived token
+    device: mobile_app_pixel_9_pro_fold
+
+  tts:
+    enabled: false  # Enable for critical alerts
+    entity: media_player.living_room_speaker
+
+  signal:
+    enabled: true
+    api_url: http://sagan.local:8080
+    sender: "+13475332155"
+    recipient: "+13475332155"  # Note-to-Self style
+    poll_interval: 30  # Check for responses every 30 seconds
+
+safety:
+  # Maximum auto-fixes allowed per hour
+  max_auto_fixes_per_hour: 3
+
+  # Never auto-restart these containers (require manual intervention)
+  never_restart:
+    - homeassistant
+    - mosquitto
+    - immich_postgres
+    - authelia
+
+  # Actions that always require explicit approval
+  require_approval:
+    - delete_data
+    - modify_config
+    - update_container
+    - prune_images

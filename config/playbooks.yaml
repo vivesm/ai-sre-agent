@@ -1,0 +1,139 @@
+# SRE Agent Playbooks
+# Rule-based responses for common issues
+# These are used by the fallback analyzer when Claude is unavailable
+
+playbooks:
+  # Container Health Issues
+  - name: container_unhealthy
+    description: "Container health check is failing"
+    condition:
+      type: container_unhealthy
+    severity: warning
+    confidence: 0.6
+    auto_fix: true
+    actions:
+      - step: 1
+        action: "Restart unhealthy container"
+        command: "docker restart {container}"
+        timeout_seconds: 60
+        reversible: true
+      - step: 2
+        action: "Wait for container to stabilize"
+        command: "sleep 30"
+        timeout_seconds: 45
+        reversible: true
+      - step: 3
+        action: "Verify container health"
+        command: "docker inspect {container} --format='{{{{.State.Health.Status}}}}'"
+        timeout_seconds: 10
+        reversible: true
+    postchecks:
+      - "docker ps --filter name={container} --format='{{{{.Status}}}}'"
+    rollback:
+      - "Container will auto-restart based on restart policy"
+    escalate_if:
+      - "retry_count > 2"
+      - "container in protected_list"
+
+  - name: container_stopped
+    description: "Container has stopped unexpectedly"
+    condition:
+      type: container_stopped
+    severity: critical
+    confidence: 0.5
+    auto_fix: true
+    actions:
+      - step: 1
+        action: "Start stopped container"
+        command: "docker start {container}"
+        timeout_seconds: 60
+        reversible: true
+    postchecks:
+      - "docker ps --filter name={container} --format='{{{{.Status}}}}'"
+    rollback:
+      - "docker stop {container}"
+
+  # Disk Space Issues
+  - name: disk_space_warning
+    description: "Disk usage above warning threshold"
+    condition:
+      type: disk_space_low
+      percent_gte: 85
+      percent_lt: 95
+    severity: warning
+    confidence: 0.5
+    auto_fix: true
+    actions:
+      - step: 1
+        action: "Clean Docker build cache"
+        command: "docker builder prune -f"
+        timeout_seconds: 120
+        reversible: false
+      - step: 2
+        action: "Remove unused Docker images"
+        command: "docker image prune -f"
+        timeout_seconds: 120
+        reversible: false
+    postchecks:
+      - "df -h {mount}"
+    rollback:
+      - "Cannot recover pruned images - rebuild required"
+
+  - name: disk_space_critical
+    description: "Disk usage at critical level"
+    condition:
+      type: disk_space_low
+      percent_gte: 95
+    severity: critical
+    confidence: 0.3  # Lower confidence due to data impact
+    auto_fix: false  # Always escalate critical disk issues
+    actions: []
+    notes: "Critical disk space requires manual intervention"
+
+  # Memory Issues
+  - name: memory_high
+    description: "Memory usage is high"
+    condition:
+      type: memory_high
+    severity: warning
+    confidence: 0.4
+    auto_fix: false  # Memory issues need investigation
+    actions: []
+    notes: "High memory often indicates a leak or misconfiguration"
+
+  # Service Issues
+  - name: service_failed
+    description: "Systemd service has failed"
+    condition:
+      type: service_failed
+    severity: warning
+    confidence: 0.4
+    auto_fix: false  # Services need manual review
+    actions: []
+    notes: "Failed services should be investigated before restart"
+
+  # Network Issues
+  - name: network_down
+    description: "Network connectivity lost"
+    condition:
+      type: network_down
+    severity: critical
+    confidence: 0.0  # Cannot fix network issues remotely
+    auto_fix: false
+    actions: []
+    notes: "Network issues require physical access or upstream fix"
+
+# Global settings for playbook execution
+settings:
+  # Containers that should never be auto-restarted
+  protected_containers:
+    - homeassistant
+    - mosquitto
+    - immich_postgres
+    - authelia
+
+  # Maximum retries before escalating
+  max_retries: 2
+
+  # Cooldown period between fix attempts (seconds)
+  cooldown_period: 300
