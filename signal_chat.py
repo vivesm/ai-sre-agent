@@ -40,6 +40,12 @@ CONTEXT_FILES = [
     Path.home() / '.claude' / 'CLAUDE.md',
 ]
 
+# Memory files - persistent knowledge base
+MEMORY_FILES = [
+    SCRIPT_DIR / 'server-inventory.md',
+    SCRIPT_DIR / 'sre-notes.md',
+]
+
 # Simple queries that don't need full Claude (use cache or quick response)
 SIMPLE_PATTERNS = ['status', 'temp', 'cpu', 'memory', 'disk', 'ip', 'uptime', 'containers']
 
@@ -72,6 +78,19 @@ def load_claude_context() -> str:
             except Exception as e:
                 logger.warning(f"Failed to read {path}: {e}")
     return '\n\n'.join(context_parts) if context_parts else ""
+
+
+def load_memory_files() -> str:
+    """Load persistent memory files (server inventory, SRE notes)."""
+    memory_parts = []
+    for path in MEMORY_FILES:
+        if path.exists():
+            try:
+                content = path.read_text()
+                memory_parts.append(f"[{path.name}]\n{content}")
+            except Exception as e:
+                logger.warning(f"Failed to read memory file {path}: {e}")
+    return '\n\n'.join(memory_parts) if memory_parts else ""
 
 
 def is_simple_query(text: str) -> bool:
@@ -285,10 +304,11 @@ class ChatCommand(Command):
         # For complex queries, send "thinking" message
         await c.send("...")
 
-        # Load chat history and infrastructure context
+        # Load chat history, infrastructure context, and memory files
         chat_history = load_chat_history()
         history_text = format_chat_history(chat_history)
         infra_context = load_claude_context()
+        memory_context = load_memory_files()
         logger.info(f"System context:\n{system_context}")
 
         # Build prompt with real system data, infrastructure docs, and conversation history
@@ -297,6 +317,9 @@ Keep responses SHORT (under 500 chars) - this is mobile messaging.
 
 ## Infrastructure Knowledge
 {infra_context}
+
+## Memory Bank (ALWAYS consult first)
+{memory_context}
 
 ## Current System State
 {system_context}
@@ -308,11 +331,13 @@ Keep responses SHORT (under 500 chars) - this is mobile messaging.
 {text}
 
 ## Instructions
+- FIRST check Memory Bank for known entity mappings, server info, and past lessons
 - Answer with actual data from the system state above - it's already been gathered for you
 - Be concise and direct - just give the answer
 - Use the conversation history to understand context (e.g., if user says "yes", check what you last asked)
 - NEVER ask for permission to run commands - just do it
 - If info isn't in the system state, run the command to get it
+- If you learn something new (entity mapping, quirk, solution), update the memory files
 - No markdown formatting (plain text only for Signal)"""
 
         # Call Claude for response (YOLO mode - 120s timeout for complex ops)
