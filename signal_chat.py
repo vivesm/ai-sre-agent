@@ -47,7 +47,19 @@ MEMORY_FILES = [
 ]
 
 # Simple queries that don't need full Claude (use cache or quick response)
-SIMPLE_PATTERNS = ['status', 'temp', 'cpu', 'memory', 'disk', 'ip', 'uptime', 'containers']
+SIMPLE_PATTERNS = ['status', 'temp', 'cpu', 'memory', 'disk', 'ip', 'uptime', 'containers', 'ram']
+
+# Phrases that should ALWAYS go to Claude (meta-questions about the bot)
+# Pattern: Hubot/Slack bots use explicit bypass for self-referential queries
+BYPASS_PATTERNS = [
+    'memory bank', 'your memory', 'your knowledge', 'your files',
+    'what do you know', 'what have you learned', 'tell me about yourself',
+    'knowledge base', 'what can you do'
+]
+
+# Clarity keywords that disambiguate "memory" as RAM (not bot knowledge)
+# Pattern: Banking chatbot research - clarity keywords reduce ambiguity
+MEMORY_CLARITY_KEYWORDS = ['usage', 'used', 'free', 'available', 'percent', 'gb', 'mb', '%']
 
 # Cache for system context (refresh every 30 seconds)
 _context_cache = {'data': None, 'time': 0}
@@ -94,8 +106,23 @@ def load_memory_files() -> str:
 
 
 def is_simple_query(text: str) -> bool:
-    """Check if query can be answered from cached system data."""
+    """Check if query can be answered from cached system data.
+
+    Uses industry-standard hybrid routing:
+    1. Check bypass patterns (always route to Claude)
+    2. Check simple patterns with clarity keywords for ambiguous terms
+    """
     text_lower = text.lower()
+
+    # Bypass: Meta-questions about the bot itself → Claude
+    if any(p in text_lower for p in BYPASS_PATTERNS):
+        return False
+
+    # Bypass: Ambiguous "memory" without clarity keywords → Claude
+    if 'memory' in text_lower and not any(k in text_lower for k in MEMORY_CLARITY_KEYWORDS):
+        return False
+
+    # Simple query: Known pattern + short message
     return any(p in text_lower for p in SIMPLE_PATTERNS) and len(text) < 50
 
 
@@ -124,7 +151,9 @@ def get_quick_response(text: str, context: str) -> str:
             if 'Uptime' in line:
                 return line.split(':', 1)[1].strip()
 
-    if 'memory' in text_lower or 'ram' in text_lower:
+    # Only match actual RAM queries (has clarity keywords or explicit "ram")
+    if 'ram' in text_lower or ('memory' in text_lower and
+            any(k in text_lower for k in MEMORY_CLARITY_KEYWORDS)):
         for line in lines:
             if 'Memory' in line:
                 return line.split(':', 1)[1].strip()
