@@ -284,6 +284,8 @@ Or reply: "approve" / "reject" / "status\""""
     def _send_signal(self, message: str, plan_id: str = None) -> tuple:
         """Send Signal message via REST API.
 
+        All alert messages are prefixed with [SRE] mode indicator.
+
         Returns:
             tuple: (success: bool, timestamp: int or None)
             The timestamp can be used to match reactions to this message.
@@ -291,6 +293,9 @@ Or reply: "approve" / "reject" / "status\""""
         if not self.signal_api_url or not self.signal_sender or not self.signal_recipient:
             logger.warning("Signal not configured")
             return False, None
+
+        # Always prefix alert messages with [SRE] mode indicator
+        message = f"[SRE] {message}"
 
         try:
             url = f"{self.signal_api_url}/v1/send"

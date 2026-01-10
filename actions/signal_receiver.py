@@ -6,9 +6,17 @@ import logging
 import re
 import urllib.request
 import urllib.error
+from enum import Enum
 from typing import Optional
 
 logger = logging.getLogger('ai-sre-agent.signal')
+
+
+class Mode(str, Enum):
+    """Agent operational modes."""
+    SRE = "SRE"
+    OPERATOR = "OPERATOR"
+    HOME = "HOME"
 
 # Try to import websockets
 try:
@@ -33,8 +41,16 @@ class SignalReceiver:
         # Convert http:// to ws:// for websocket URL
         self.ws_url = self.api_url.replace('http://', 'ws://').replace('https://', 'wss://')
 
-        # Operator mode state per sender
-        self.operator_mode = {}  # {sender_number: bool}
+        # User mode state per sender (defaults to SRE)
+        self.user_mode = {}  # {sender_number: Mode}
+
+    def get_mode(self, sender: str) -> Mode:
+        """Get current mode for a sender (defaults to SRE)."""
+        return self.user_mode.get(sender, Mode.SRE)
+
+    def set_mode(self, sender: str, mode: Mode):
+        """Set mode for a sender."""
+        self.user_mode[sender] = mode
 
     def poll_messages(self) -> list:
         """
@@ -205,34 +221,56 @@ class SignalReceiver:
         """
         Parse command text into structured command.
 
-        Supported commands:
-        - /operator - Enter operator mode
-        - approve <plan_id> / yes <plan_id> / ok <plan_id>
-        - reject <plan_id> / no <plan_id> / deny <plan_id>
-        - status
-        - help
+        Mode switch commands (work in any mode):
+        - /sre - Switch to SRE mode
+        - /operator - Switch to operator mode
+        - /home - Switch to home mode
 
         Args:
             text: Message text
-            sender: Sender phone number (for operator mode state)
+            sender: Sender phone number (for mode state)
 
         Returns:
-            Command dict with 'action' and optional 'plan_id'
+            Command dict with 'action' and optional params
         """
         text_lower = text.lower().strip()
         text_orig = text.strip()  # Keep original case for content
 
-        # Check for /operator command
+        # Mode switch commands (work from any mode)
+        if text_lower == '/sre':
+            return {'action': 'mode_switch', 'mode': Mode.SRE, 'sender': sender}
         if text_lower == '/operator':
-            self.operator_mode[sender] = True
-            return {'action': 'operator_enter', 'sender': sender}
+            return {'action': 'mode_switch', 'mode': Mode.OPERATOR, 'sender': sender}
+        if text_lower == '/home':
+            return {'action': 'mode_switch', 'mode': Mode.HOME, 'sender': sender}
 
-        # If in operator mode, parse operator commands
-        if sender and self.operator_mode.get(sender):
+        # Route based on current mode
+        current_mode = self.get_mode(sender)
+
+        if current_mode == Mode.OPERATOR:
             return self._parse_operator_command(text_orig, sender)
+        elif current_mode == Mode.HOME:
+            return self._parse_home_command(text_orig, sender)
+        else:  # SRE mode (default)
+            return self._parse_sre_command(text_lower, sender)
 
-        text = text_lower  # Use lowercase for normal commands
+    def _parse_sre_command(self, text: str, sender: str) -> Optional[dict]:
+        """
+        Parse SRE mode commands.
 
+        SRE commands:
+        - approve <plan_id> / yes <plan_id> / ok <plan_id>
+        - reject <plan_id> / no <plan_id> / deny <plan_id>
+        - status / ?
+        - help
+
+        Args:
+            text: Lowercase message text
+            sender: Sender phone number
+
+        Returns:
+            Command dict with 'action' and optional 'plan_id'
+        """
         # Approve patterns
         approve_match = re.match(r'^(approve|yes|ok|execute|run)\s+(\S+)', text)
         if approve_match:
@@ -275,6 +313,40 @@ class SignalReceiver:
         logger.debug(f"Routing to chat: {text}")
         return {'action': 'chat', 'text': text}
 
+    def _parse_home_command(self, text: str, sender: str) -> Optional[dict]:
+        """
+        Parse home mode commands.
+
+        Home commands (placeholder for future):
+        - lights on/off
+        - status
+        - Any other text -> home_chat
+
+        Args:
+            text: Message text
+            sender: Sender phone number
+
+        Returns:
+            Command dict with 'action' and params
+        """
+        text_lower = text.lower().strip()
+
+        # Simple light commands (placeholder)
+        if text_lower in ['lights on', 'lights off']:
+            return {'action': 'home_lights', 'state': text_lower.split()[1]}
+
+        # Status in home mode
+        if text_lower in ['status', '?']:
+            return {'action': 'home_status'}
+
+        # Help in home mode
+        if text_lower in ['help', 'commands']:
+            return {'action': 'home_help'}
+
+        # Any other message - treat as home chat
+        logger.debug(f"Routing to home chat: {text}")
+        return {'action': 'home_chat', 'text': text}
+
     def _parse_operator_command(self, text: str, sender: str) -> Optional[dict]:
         """
         Parse operator mode commands.
@@ -301,10 +373,9 @@ class SignalReceiver:
         parts = text.split(maxsplit=2)
         cmd = parts[0].lower() if parts else ''
 
-        # Exit operator mode
+        # Exit operator mode (switch back to SRE)
         if cmd in ['exit', 'quit', 'done', 'back']:
-            self.operator_mode[sender] = False
-            return {'action': 'operator_exit', 'sender': sender}
+            return {'action': 'mode_switch', 'mode': Mode.SRE, 'sender': sender}
 
         # Memory commands
         if cmd == 'memory':
@@ -351,18 +422,23 @@ class SignalReceiver:
         # Unknown operator command
         return {'action': 'operator_unknown', 'text': text}
 
-    def send_response(self, message: str) -> bool:
+    def send_response(self, message: str, mode: Mode = None) -> bool:
         """
-        Send a response message via Signal.
+        Send a response message via Signal with optional mode prefix.
 
         Args:
             message: Response text to send
+            mode: Optional mode to prefix message with (e.g., [SRE], [OPERATOR])
 
         Returns:
             True if sent successfully
         """
         if not self.enabled or not self.api_url:
             return False
+
+        # Add mode prefix if specified
+        if mode:
+            message = f"[{mode.value}] {message}"
 
         try:
             url = f"{self.api_url}/v1/send"
@@ -387,7 +463,7 @@ class SignalReceiver:
             logger.error(f"Failed to send Signal response: {e}")
             return False
 
-    def send_help(self) -> bool:
+    def send_help(self, mode: Mode = None) -> bool:
         """Send help message with available commands."""
         help_text = """🤖 SRE Agent Commands:
 
@@ -396,21 +472,22 @@ class SignalReceiver:
 • status - List all pending plans
 • help - Show this message
 
-If plan_id is omitted, the most recent pending plan is used.
+Modes: /sre, /operator, /home
 
 Shortcuts: yes/ok (approve), no/deny (reject)"""
 
-        return self.send_response(help_text)
+        return self.send_response(help_text, mode=mode or Mode.SRE)
 
-    def send_status(self, plans: list) -> bool:
+    def send_status(self, plans: list, mode: Mode = None) -> bool:
         """
         Send status message with pending plans.
 
         Args:
             plans: List of pending plan dicts
+            mode: Optional mode for message prefix
         """
         if not plans:
-            return self.send_response("📋 No pending plans.")
+            return self.send_response("📋 No pending plans.", mode=mode or Mode.SRE)
 
         lines = ["📋 Pending Plans:\n"]
         for plan in plans[:5]:  # Limit to 5 most recent
@@ -424,4 +501,4 @@ Shortcuts: yes/ok (approve), no/deny (reject)"""
 
         lines.append("\nReply: approve <id> or reject <id>")
 
-        return self.send_response("\n".join(lines))
+        return self.send_response("\n".join(lines), mode=mode or Mode.SRE)

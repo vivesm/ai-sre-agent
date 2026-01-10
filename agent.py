@@ -24,7 +24,7 @@ from collectors.logs import LogCollector
 from analyzer.claude import ClaudeAnalyzer
 from actions.notify import Notifier
 from actions.execute import Executor
-from actions.signal_receiver import SignalReceiver
+from actions.signal_receiver import SignalReceiver, Mode
 from dedup import AlertDeduplicator
 from memory import MemoryManager
 
@@ -270,7 +270,11 @@ class SREAgent:
 
             logger.info(f"Processing Signal command: {action} {plan_id or ''}")
 
-            if action == 'approve':
+            # Mode switching (works from any mode)
+            if action == 'mode_switch':
+                self._handle_mode_switch(cmd)
+            # SRE mode commands
+            elif action == 'approve':
                 self._handle_signal_approve(plan_id)
             elif action == 'reject':
                 self._handle_signal_reject(plan_id)
@@ -281,16 +285,12 @@ class SREAgent:
                 )
             elif action == 'status':
                 plans = self.list_plans('pending')
-                self.signal_receiver.send_status(plans)
+                self.signal_receiver.send_status(plans, mode=Mode.SRE)
             elif action == 'help':
-                self.signal_receiver.send_help()
+                self.signal_receiver.send_help(mode=Mode.SRE)
             elif action == 'chat':
                 self._handle_signal_chat(cmd.get('text', ''), cmd.get('raw_text', ''))
             # Operator mode commands
-            elif action == 'operator_enter':
-                self._handle_operator_enter()
-            elif action == 'operator_exit':
-                self._handle_operator_exit()
             elif action == 'operator_memory_show':
                 self._handle_operator_memory_show()
             elif action == 'operator_memory_add':
@@ -310,7 +310,10 @@ class SREAgent:
             elif action == 'operator_help':
                 self._handle_operator_help(cmd.get('topic'))
             elif action == 'operator_unknown':
-                self.signal_receiver.send_response(f"❓ Unknown command: {cmd.get('text', '')}\nType 'help' for commands.")
+                self.signal_receiver.send_response(
+                    f"❓ Unknown command: {cmd.get('text', '')}\nType 'help' for commands.",
+                    mode=Mode.OPERATOR
+                )
 
     def _validate_issue_persists(self, plan: dict) -> tuple:
         """Check if the issue that triggered this plan still exists.
@@ -362,7 +365,7 @@ class SREAgent:
         plans = self.list_plans('pending')
 
         if not plans:
-            self.signal_receiver.send_response("📭 No pending plans to approve.")
+            self.signal_receiver.send_response("📭 No pending plans to approve.", mode=Mode.SRE)
             return
 
         # Find the plan to approve
@@ -378,7 +381,8 @@ class SREAgent:
             if not target_plan:
                 self.signal_receiver.send_response(
                     f"❓ Plan '{plan_id}' not found.\n\n"
-                    f"Available plans: {', '.join(p.get('plan_id', '')[:8] for p in plans[:5])}"
+                    f"Available plans: {', '.join(p.get('plan_id', '')[:8] for p in plans[:5])}",
+                    mode=Mode.SRE
                 )
                 return
         else:
@@ -396,7 +400,8 @@ class SREAgent:
                 # If plan is older than 5 minutes, validate issue still exists
                 if plan_age.total_seconds() > 300:
                     self.signal_receiver.send_response(
-                        f"🔍 Checking if issue still persists..."
+                        f"🔍 Checking if issue still persists...",
+                        mode=Mode.SRE
                     )
                     persists, msg = self._validate_issue_persists(target_plan)
 
@@ -406,7 +411,8 @@ class SREAgent:
                         self.signal_receiver.send_response(
                             f"✨ Good news! The issue has resolved itself.\n\n"
                             f"Plan {pid} canceled - no action needed.\n"
-                            f"Reason: {msg}"
+                            f"Reason: {msg}",
+                            mode=Mode.SRE
                         )
                         return
             except Exception as e:
@@ -416,26 +422,28 @@ class SREAgent:
         if self.approve_plan(pid):
             self.signal_receiver.send_response(
                 f"✅ Plan {pid} approved.\n\n"
-                f"Executing: {target_plan.get('summary', 'Unknown')}"
+                f"Executing: {target_plan.get('summary', 'Unknown')}",
+                mode=Mode.SRE
             )
             # Execute immediately
             result = self.execute_plan(target_plan)
             if result.get('success'):
-                self.signal_receiver.send_response(f"🎉 Plan {pid} executed successfully!")
+                self.signal_receiver.send_response(f"🎉 Plan {pid} executed successfully!", mode=Mode.SRE)
             else:
                 self.signal_receiver.send_response(
                     f"❌ Plan {pid} execution failed.\n\n"
-                    f"Error: {result.get('error', 'Unknown')}"
+                    f"Error: {result.get('error', 'Unknown')}",
+                    mode=Mode.SRE
                 )
         else:
-            self.signal_receiver.send_response(f"❌ Failed to approve plan {pid}")
+            self.signal_receiver.send_response(f"❌ Failed to approve plan {pid}", mode=Mode.SRE)
 
     def _handle_signal_reject(self, plan_id: str = None):
         """Handle reject command from Signal."""
         plans = self.list_plans('pending')
 
         if not plans:
-            self.signal_receiver.send_response("📭 No pending plans to reject.")
+            self.signal_receiver.send_response("📭 No pending plans to reject.", mode=Mode.SRE)
             return
 
         # Find the plan to reject
@@ -450,7 +458,8 @@ class SREAgent:
             if not target_plan:
                 self.signal_receiver.send_response(
                     f"❓ Plan '{plan_id}' not found.\n\n"
-                    f"Available plans: {', '.join(p.get('plan_id', '')[:8] for p in plans[:5])}"
+                    f"Available plans: {', '.join(p.get('plan_id', '')[:8] for p in plans[:5])}",
+                    mode=Mode.SRE
                 )
                 return
         else:
@@ -462,10 +471,11 @@ class SREAgent:
         if self.reject_plan(pid, reason="Rejected via Signal"):
             self.signal_receiver.send_response(
                 f"🚫 Plan {pid} rejected.\n\n"
-                f"Dismissed: {target_plan.get('summary', 'Unknown')}"
+                f"Dismissed: {target_plan.get('summary', 'Unknown')}",
+                mode=Mode.SRE
             )
         else:
-            self.signal_receiver.send_response(f"❌ Failed to reject plan {pid}")
+            self.signal_receiver.send_response(f"❌ Failed to reject plan {pid}", mode=Mode.SRE)
 
     def _handle_signal_reaction(self, emoji: str, target_timestamp: int):
         """Handle emoji reaction to a plan notification message.
@@ -511,22 +521,37 @@ class SREAgent:
 
     # ========== Operator Mode Handlers ==========
 
-    def _handle_operator_enter(self):
-        """Enter operator mode."""
-        self.signal_receiver.send_response(
-            "🔧 Operator mode active.\n\n"
-            "Commands:\n"
-            "• memory show/add/clear\n"
-            "• rules list/show/add\n"
-            "• context\n"
-            "• reload\n"
-            "• exit\n\n"
-            "Type 'help' for details."
-        )
+    def _handle_mode_switch(self, cmd: dict):
+        """Handle mode switching command."""
+        sender = cmd.get('sender')
+        new_mode = cmd.get('mode')
 
-    def _handle_operator_exit(self):
-        """Exit operator mode."""
-        self.signal_receiver.send_response("👋 Exited operator mode.")
+        self.signal_receiver.set_mode(sender, new_mode)
+        logger.info(f"Mode switched to {new_mode.value} for {sender}")
+
+        if new_mode == Mode.SRE:
+            self.signal_receiver.send_response(
+                "👋 Monitoring mode.\n\n"
+                "Commands: approve, reject, status, ?\n"
+                "Or ask me anything about your system.",
+                mode=Mode.SRE
+            )
+        elif new_mode == Mode.OPERATOR:
+            self.signal_receiver.send_response(
+                "🔧 Configuration mode.\n\n"
+                "Commands:\n"
+                "• memory show/add/clear\n"
+                "• rules list/show/add\n"
+                "• context, reload\n"
+                "• /sre to exit",
+                mode=Mode.OPERATOR
+            )
+        elif new_mode == Mode.HOME:
+            self.signal_receiver.send_response(
+                "🏠 Home mode. (Coming soon)\n\n"
+                "• /sre to exit",
+                mode=Mode.HOME
+            )
 
     def _handle_operator_memory_show(self):
         """Show memory.md contents."""
@@ -534,25 +559,25 @@ class SREAgent:
         # Truncate if too long for Signal
         if len(content) > 1500:
             content = content[:1500] + "\n\n... (truncated)"
-        self.signal_receiver.send_response(f"📝 Memory:\n\n{content}")
+        self.signal_receiver.send_response(f"📝 Memory:\n\n{content}", mode=Mode.OPERATOR)
 
     def _handle_operator_memory_add(self, text: str):
         """Add to memory."""
         if not text:
-            self.signal_receiver.send_response("❌ Usage: memory add <text>")
+            self.signal_receiver.send_response("❌ Usage: memory add <text>", mode=Mode.OPERATOR)
             return
 
         if self.memory.add_memory(text):
-            self.signal_receiver.send_response(f"✅ Added to memory:\n{text}")
+            self.signal_receiver.send_response(f"✅ Added to memory:\n{text}", mode=Mode.OPERATOR)
         else:
-            self.signal_receiver.send_response("❌ Failed to add to memory")
+            self.signal_receiver.send_response("❌ Failed to add to memory", mode=Mode.OPERATOR)
 
     def _handle_operator_memory_clear(self):
         """Clear memory."""
         if self.memory.clear_memory():
-            self.signal_receiver.send_response("🗑️ Memory cleared")
+            self.signal_receiver.send_response("🗑️ Memory cleared", mode=Mode.OPERATOR)
         else:
-            self.signal_receiver.send_response("❌ Failed to clear memory")
+            self.signal_receiver.send_response("❌ Failed to clear memory", mode=Mode.OPERATOR)
 
     def _handle_operator_rules_list(self):
         """List rule files."""
@@ -560,15 +585,16 @@ class SREAgent:
         if rules:
             self.signal_receiver.send_response(
                 f"📋 Rules ({len(rules)}):\n" +
-                "\n".join(f"• {r}" for r in rules)
+                "\n".join(f"• {r}" for r in rules),
+                mode=Mode.OPERATOR
             )
         else:
-            self.signal_receiver.send_response("📋 No rule files found")
+            self.signal_receiver.send_response("📋 No rule files found", mode=Mode.OPERATOR)
 
     def _handle_operator_rules_show(self, name: str):
         """Show a rule file."""
         if not name:
-            self.signal_receiver.send_response("❌ Usage: rules show <name>")
+            self.signal_receiver.send_response("❌ Usage: rules show <name>", mode=Mode.OPERATOR)
             return
 
         content = self.memory.get_rule(name)
@@ -576,20 +602,20 @@ class SREAgent:
             # Truncate if too long
             if len(content) > 1500:
                 content = content[:1500] + "\n\n... (truncated)"
-            self.signal_receiver.send_response(f"📄 {name}.md:\n\n{content}")
+            self.signal_receiver.send_response(f"📄 {name}.md:\n\n{content}", mode=Mode.OPERATOR)
         else:
-            self.signal_receiver.send_response(f"❌ Rule '{name}' not found")
+            self.signal_receiver.send_response(f"❌ Rule '{name}' not found", mode=Mode.OPERATOR)
 
     def _handle_operator_rules_add(self, name: str, content: str):
         """Add to a rule file."""
         if not name or not content:
-            self.signal_receiver.send_response("❌ Usage: rules add <name> <content>")
+            self.signal_receiver.send_response("❌ Usage: rules add <name> <content>", mode=Mode.OPERATOR)
             return
 
         if self.memory.add_rule(name, content):
-            self.signal_receiver.send_response(f"✅ Added to {name}.md:\n{content}")
+            self.signal_receiver.send_response(f"✅ Added to {name}.md:\n{content}", mode=Mode.OPERATOR)
         else:
-            self.signal_receiver.send_response("❌ Failed to add rule")
+            self.signal_receiver.send_response("❌ Failed to add rule", mode=Mode.OPERATOR)
 
     def _handle_operator_context(self):
         """Show loaded context files."""
@@ -598,16 +624,16 @@ class SREAgent:
             lines = [f"📂 Context files ({len(files)}):"]
             for path, ftype in files:
                 lines.append(f"• [{ftype}] {path}")
-            self.signal_receiver.send_response("\n".join(lines))
+            self.signal_receiver.send_response("\n".join(lines), mode=Mode.OPERATOR)
         else:
-            self.signal_receiver.send_response("📂 No context files loaded")
+            self.signal_receiver.send_response("📂 No context files loaded", mode=Mode.OPERATOR)
 
     def _handle_operator_reload(self):
         """Reload context files."""
         # Reinitialize memory manager to reload files
         self.memory = MemoryManager(working_dir=Path.cwd())
         files = self.memory.get_context_files()
-        self.signal_receiver.send_response(f"🔄 Reloaded {len(files)} context files")
+        self.signal_receiver.send_response(f"🔄 Reloaded {len(files)} context files", mode=Mode.OPERATOR)
 
     def _handle_operator_help(self, topic: str = None):
         """Show operator mode help."""
@@ -616,14 +642,16 @@ class SREAgent:
                 "📝 Memory Commands:\n\n"
                 "• memory show - View learnings\n"
                 "• memory add <text> - Add a learning\n"
-                "• memory clear - Clear all"
+                "• memory clear - Clear all",
+                mode=Mode.OPERATOR
             )
         elif topic == 'rules':
             self.signal_receiver.send_response(
                 "📋 Rules Commands:\n\n"
                 "• rules list - List rule files\n"
                 "• rules show <name> - View a rule\n"
-                "• rules add <name> <content> - Add to rule"
+                "• rules add <name> <content> - Add to rule",
+                mode=Mode.OPERATOR
             )
         else:
             self.signal_receiver.send_response(
@@ -639,7 +667,8 @@ class SREAgent:
                 "Other:\n"
                 "• context - Show loaded files\n"
                 "• reload - Refresh context\n"
-                "• exit - Leave operator mode"
+                "• /sre - Return to SRE mode",
+                mode=Mode.OPERATOR
             )
 
     # ========== End Operator Mode Handlers ==========
@@ -649,7 +678,7 @@ class SREAgent:
         import subprocess
 
         # Send acknowledgment for potentially slow operations
-        self.signal_receiver.send_response("🤔 Thinking...")
+        self.signal_receiver.send_response("🤔 Thinking...", mode=Mode.SRE)
 
         # Gather current system context
         evidence = self.collect_evidence()
@@ -699,7 +728,7 @@ Respond in plain text only."""
 
             if result.returncode == 0:
                 response = result.stdout.strip()[:1500]
-                self.signal_receiver.send_response(response)
+                self.signal_receiver.send_response(response, mode=Mode.SRE)
                 # Save to history
                 self._save_chat_history(message, response)
             else:
@@ -707,14 +736,15 @@ Respond in plain text only."""
                 self.signal_receiver.send_response(
                     "❌ Couldn't process that. Try:\n"
                     "• status - system overview\n"
-                    "• help - all commands"
+                    "• help - all commands",
+                    mode=Mode.SRE
                 )
 
         except subprocess.TimeoutExpired:
-            self.signal_receiver.send_response("⏱️ Taking too long. Try a simpler question?")
+            self.signal_receiver.send_response("⏱️ Taking too long. Try a simpler question?", mode=Mode.SRE)
         except Exception as e:
             logger.error(f"Signal chat failed: {e}")
-            self.signal_receiver.send_response("❌ Error. Try: status, help")
+            self.signal_receiver.send_response("❌ Error. Try: status, help", mode=Mode.SRE)
 
     def _load_chat_history(self) -> list:
         """Load recent chat messages for context."""
