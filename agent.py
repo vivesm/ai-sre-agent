@@ -25,6 +25,7 @@ from analyzer.claude import ClaudeAnalyzer
 from actions.notify import Notifier
 from actions.execute import Executor
 from actions.signal_receiver import SignalReceiver
+from dedup import AlertDeduplicator
 
 # Setup logging
 def setup_logging():
@@ -72,6 +73,13 @@ class SREAgent:
         self.notifier = Notifier(self.config.get('notifications', {}))
         self.executor = Executor(self.config.get('safety', {}))
         self.signal_receiver = SignalReceiver(self.config.get('notifications', {}))
+
+        # Alert deduplication
+        dedup_config = self.config.get('agent', {}).get('dedup', {})
+        self.deduplicator = AlertDeduplicator(
+            state_file=Path('data/alert_state.json'),
+            suppress_hours=dedup_config.get('suppress_hours', 2.0)
+        )
 
         # State
         self.plans_dir = Path('data/plans')
@@ -148,7 +156,16 @@ class SREAgent:
     def notify_user(self, plan: dict) -> bool:
         """Send notification about pending plan."""
         try:
-            return self.notifier.send_plan_notification(plan)
+            result = self.notifier.send_plan_notification(plan)
+
+            # Re-save plan if notification_timestamp was added (for reaction matching)
+            if plan.get('notification_timestamp'):
+                plan_file = self.plans_dir / f"{plan['plan_id']}.json"
+                with open(plan_file, 'w') as f:
+                    json.dump(plan, f, indent=2)
+                logger.debug(f"Saved notification_timestamp {plan['notification_timestamp']} for plan {plan['plan_id']}")
+
+            return result
         except Exception as e:
             logger.error(f"Notification failed: {e}")
             return False
@@ -206,17 +223,33 @@ class SREAgent:
 
         # 1. Collect evidence
         evidence = self.collect_evidence()
+        all_issues = evidence.get('issues', [])
 
         # 2. Check for existing approved plans first
         approved_plans = self.check_approvals()
         for plan in approved_plans:
             self.execute_plan(plan)
 
-        # 3. Analyze new issues and create plans
-        if evidence.get('issues'):
-            plan = self.analyze_and_plan(evidence)
+        # 3. Filter issues through deduplicator (suppress repeats)
+        new_issues = [
+            issue for issue in all_issues
+            if self.deduplicator.should_alert(issue)
+        ]
+
+        # 4. Clear resolved alerts (issues that are no longer occurring)
+        self.deduplicator.clear_resolved(all_issues)
+
+        # 5. Analyze only NEW issues and create plans
+        if new_issues:
+            logger.info(f"Processing {len(new_issues)} new issues (suppressed {len(all_issues) - len(new_issues)})")
+            filtered_evidence = {**evidence, 'issues': new_issues}
+            plan = self.analyze_and_plan(filtered_evidence)
             if plan:
                 self.notify_user(plan)
+        elif all_issues:
+            logger.info(f"All {len(all_issues)} issues suppressed (already alerted)")
+        else:
+            logger.info("No issues detected")
 
         logger.info("Monitoring cycle complete")
 
@@ -237,6 +270,11 @@ class SREAgent:
                 self._handle_signal_approve(plan_id)
             elif action == 'reject':
                 self._handle_signal_reject(plan_id)
+            elif action == 'reaction':
+                self._handle_signal_reaction(
+                    cmd.get('emoji', ''),
+                    cmd.get('target_timestamp')
+                )
             elif action == 'status':
                 plans = self.list_plans('pending')
                 self.signal_receiver.send_status(plans)
@@ -244,6 +282,51 @@ class SREAgent:
                 self.signal_receiver.send_help()
             elif action == 'chat':
                 self._handle_signal_chat(cmd.get('text', ''), cmd.get('raw_text', ''))
+
+    def _validate_issue_persists(self, plan: dict) -> tuple:
+        """Check if the issue that triggered this plan still exists.
+
+        Returns:
+            tuple: (persists: bool, message: str)
+        """
+        try:
+            # Re-collect current evidence
+            current_evidence = self.collect_evidence()
+            current_issues = current_evidence.get('issues', [])
+
+            # If no current issues, the problem is resolved
+            if not current_issues:
+                return False, "No issues currently detected"
+
+            # Get the original evidence from plan
+            plan_evidence = plan.get('evidence', [])
+
+            # If plan has no evidence to compare, assume issue persists
+            if not plan_evidence:
+                return True, "Cannot validate (no original evidence)"
+
+            # Check if similar issue still exists
+            for original in plan_evidence:
+                original_lower = str(original).lower()
+
+                for current in current_issues:
+                    current_msg = current.get('message', '').lower()
+                    current_type = current.get('type', '').lower()
+
+                    # Match by issue type or keywords from original evidence
+                    if current_type in original_lower:
+                        return True, f"Issue persists: {current_type}"
+
+                    # Check for keyword overlap
+                    original_words = set(original_lower.split()[:5])
+                    if any(word in current_msg for word in original_words if len(word) > 3):
+                        return True, f"Similar issue found: {current.get('message', '')[:50]}"
+
+            return False, "Original issue appears resolved"
+
+        except Exception as e:
+            logger.warning(f"Issue validation failed: {e}, assuming issue persists")
+            return True, f"Validation error: {e}"
 
     def _handle_signal_approve(self, plan_id: str = None):
         """Handle approve command from Signal."""
@@ -273,8 +356,34 @@ class SREAgent:
             # Use most recent pending plan
             target_plan = plans[0]
 
-        # Approve the plan
         pid = target_plan.get('plan_id')
+
+        # Check if plan is stale and validate issue still persists
+        created_at = target_plan.get('created_at', '')
+        if created_at:
+            try:
+                plan_age = datetime.utcnow() - datetime.fromisoformat(created_at)
+
+                # If plan is older than 5 minutes, validate issue still exists
+                if plan_age.total_seconds() > 300:
+                    self.signal_receiver.send_response(
+                        f"🔍 Checking if issue still persists..."
+                    )
+                    persists, msg = self._validate_issue_persists(target_plan)
+
+                    if not persists:
+                        # Cancel the stale plan
+                        self.reject_plan(pid, reason="Issue resolved automatically")
+                        self.signal_receiver.send_response(
+                            f"✨ Good news! The issue has resolved itself.\n\n"
+                            f"Plan {pid} canceled - no action needed.\n"
+                            f"Reason: {msg}"
+                        )
+                        return
+            except Exception as e:
+                logger.warning(f"Plan age check failed: {e}")
+
+        # Approve the plan
         if self.approve_plan(pid):
             self.signal_receiver.send_response(
                 f"✅ Plan {pid} approved.\n\n"
@@ -328,6 +437,48 @@ class SREAgent:
             )
         else:
             self.signal_receiver.send_response(f"❌ Failed to reject plan {pid}")
+
+    def _handle_signal_reaction(self, emoji: str, target_timestamp: int):
+        """Handle emoji reaction to a plan notification message.
+
+        Args:
+            emoji: The reaction emoji (e.g., 👍, 👎)
+            target_timestamp: Timestamp of the message being reacted to
+        """
+        if not target_timestamp:
+            logger.debug("Reaction without target timestamp, ignoring")
+            return
+
+        # Define emoji mappings
+        approve_emojis = ['👍', '👌', '✅', '🚀', '💪', '🎉']
+        reject_emojis = ['👎', '❌', '🚫', '⛔', '🛑']
+
+        # Find plan by notification timestamp
+        for plan_file in self.plans_dir.glob('*.json'):
+            try:
+                with open(plan_file) as f:
+                    plan = json.load(f)
+
+                if plan.get('notification_timestamp') == target_timestamp:
+                    plan_id = plan.get('plan_id')
+                    logger.info(f"Reaction {emoji} matched plan {plan_id}")
+
+                    if emoji in approve_emojis:
+                        self._handle_signal_approve(plan_id)
+                        return
+                    elif emoji in reject_emojis:
+                        self._handle_signal_reject(plan_id)
+                        return
+                    else:
+                        # Unrecognized emoji on a plan message
+                        logger.debug(f"Unrecognized reaction {emoji} on plan {plan_id}")
+                        return
+
+            except Exception as e:
+                logger.error(f"Error reading plan {plan_file}: {e}")
+
+        # No matching plan found - might be reaction to other message
+        logger.debug(f"Reaction {emoji} on timestamp {target_timestamp} doesn't match any pending plan")
 
     def _handle_signal_chat(self, message: str, raw_text: str = ''):
         """Process free-form message with Claude."""

@@ -71,7 +71,7 @@ To reject: sre-agent reject {plan_id}
 
         success = True
 
-        # Build Signal-friendly message with reply instructions
+        # Build Signal-friendly message with reaction and reply instructions
         signal_message = f"""🔔 {title}
 
 Plan ID: {plan_id}
@@ -84,16 +84,20 @@ Proposed Actions:
 {steps_text}
 Risk: {plan.get('risk', 'unknown')}
 
-Reply with:
-• "approve {plan_id}" to execute
-• "reject {plan_id}" to dismiss
-• "status" to see all pending plans"""
+React with:
+• 👍 to approve
+• 👎 to reject
+
+Or reply: "approve" / "reject" / "status\""""
 
         # Send based on severity
         if severity == 'critical':
             # All channels for critical
             if self.signal_enabled:
-                success &= self._send_signal(signal_message, plan_id)
+                signal_success, timestamp = self._send_signal(signal_message, plan_id)
+                success &= signal_success
+                if timestamp:
+                    plan['notification_timestamp'] = timestamp
             if self.push_enabled:
                 success &= self._send_mobile_push(title, body, plan_id, priority='high')
             if self.email_enabled:
@@ -103,7 +107,10 @@ Reply with:
         elif severity == 'warning':
             # Signal + Mobile push for warnings
             if self.signal_enabled:
-                success &= self._send_signal(signal_message, plan_id)
+                signal_success, timestamp = self._send_signal(signal_message, plan_id)
+                success &= signal_success
+                if timestamp:
+                    plan['notification_timestamp'] = timestamp
             if self.push_enabled:
                 success &= self._send_mobile_push(title, body, plan_id)
         else:
@@ -133,7 +140,8 @@ Reply with:
 
         # Signal is preferred for quick feedback
         if self.signal_enabled:
-            success &= self._send_signal(signal_message, plan_id)
+            signal_success, _ = self._send_signal(signal_message, plan_id)
+            success &= signal_success
         if self.push_enabled:
             success &= self._send_mobile_push(title, body, plan_id)
         elif self.email_enabled:
@@ -273,11 +281,16 @@ Reply with:
             logger.error(f"Failed to send TTS: {e}")
             return False
 
-    def _send_signal(self, message: str, plan_id: str = None) -> bool:
-        """Send Signal message via REST API."""
+    def _send_signal(self, message: str, plan_id: str = None) -> tuple:
+        """Send Signal message via REST API.
+
+        Returns:
+            tuple: (success: bool, timestamp: int or None)
+            The timestamp can be used to match reactions to this message.
+        """
         if not self.signal_api_url or not self.signal_sender or not self.signal_recipient:
             logger.warning("Signal not configured")
-            return False
+            return False, None
 
         try:
             url = f"{self.signal_api_url}/v1/send"
@@ -297,18 +310,21 @@ Reply with:
 
             with urllib.request.urlopen(req, timeout=15) as response:
                 if response.status in [200, 201]:
-                    logger.info(f"Signal message sent: {message[:50]}...")
-                    return True
+                    # Parse response to get message timestamp
+                    resp_data = json.loads(response.read().decode())
+                    timestamp = resp_data.get('timestamp')
+                    logger.info(f"Signal message sent (ts={timestamp}): {message[:50]}...")
+                    return True, timestamp
                 else:
                     logger.error(f"Signal send failed: {response.status}")
-                    return False
+                    return False, None
 
         except urllib.error.HTTPError as e:
             logger.error(f"Signal HTTP error: {e.code} - {e.reason}")
-            return False
+            return False, None
         except urllib.error.URLError as e:
             logger.error(f"Signal connection error: {e.reason}")
-            return False
+            return False, None
         except Exception as e:
             logger.error(f"Failed to send Signal message: {e}")
-            return False
+            return False, None

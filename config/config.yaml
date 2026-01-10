@@ -3,8 +3,13 @@
 
 agent:
   name: "Atom SRE Agent"
-  check_interval: 300  # 5 minutes
+  check_interval: 900  # 15 minutes
   dry_run: true  # Start in dry-run mode for safety
+
+  # Alert deduplication to prevent spam
+  dedup:
+    enabled: true
+    suppress_hours: 2.0  # Re-alert after 2 hours if issue persists
 
 llm:
   # Uses Claude Code CLI (already installed and authenticated)

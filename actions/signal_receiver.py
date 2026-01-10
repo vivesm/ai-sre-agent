@@ -74,7 +74,24 @@ class SignalReceiver:
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
                         logger.info(f"Raw message received: {msg[:200]}...")
-                        data = json.loads(msg)
+
+                        # Handle potentially corrupted JSON (signal-cli-rest-api bug #680)
+                        try:
+                            data = json.loads(msg)
+                        except json.JSONDecodeError:
+                            # Try to extract JSON portion before any traceback
+                            if '{' in msg and '}' in msg:
+                                json_part = msg[:msg.rfind('}')+1]
+                                try:
+                                    data = json.loads(json_part)
+                                    logger.warning("Recovered from corrupted JSON in Signal message")
+                                except json.JSONDecodeError:
+                                    logger.error(f"Failed to parse Signal message: {msg[:100]}...")
+                                    continue
+                            else:
+                                logger.error(f"Invalid Signal message format: {msg[:100]}...")
+                                continue
+
                         cmd = self._parse_message(data)
                         if cmd:
                             logger.info(f"Parsed command: {cmd}")
@@ -116,6 +133,29 @@ class SignalReceiver:
             logger.info(f"Message types in envelope: {msg_types}")
             sender = envelope.get('source', '')
             timestamp = envelope.get('timestamp', 0)
+
+            # Check for reaction messages first (in syncMessage.sentMessage.reaction)
+            sync_message = envelope.get('syncMessage', {})
+            sent_message = sync_message.get('sentMessage', {})
+            reaction = sent_message.get('reaction')
+
+            if reaction and not reaction.get('isRemove', False):
+                emoji = reaction.get('emoji', '')
+                target_timestamp = reaction.get('targetSentTimestamp')
+                logger.info(f"Reaction received: {emoji} on message {target_timestamp}")
+
+                # Only process reactions from authorized sender
+                if sender != self.recipient:
+                    logger.debug(f"Ignoring reaction from unauthorized sender: {sender}")
+                    return None
+
+                return {
+                    'action': 'reaction',
+                    'emoji': emoji,
+                    'target_timestamp': target_timestamp,
+                    'sender': sender,
+                    'timestamp': timestamp
+                }
 
             # Try to get message text from different structures
             text = ''
@@ -207,11 +247,11 @@ class SignalReceiver:
             }
 
         # Status command
-        if text in ['status', 'pending', 'list', 'plans']:
+        if text in ['status', 'pending', 'list', 'plans', '?']:
             return {'action': 'status'}
 
         # Help command
-        if text in ['help', '?', 'commands']:
+        if text in ['help', 'commands']:
             return {'action': 'help'}
 
         # Any other message - treat as chat for Claude
