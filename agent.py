@@ -24,7 +24,8 @@ from collectors.logs import LogCollector
 from analyzer.claude import ClaudeAnalyzer
 from actions.notify import Notifier
 from actions.execute import Executor
-from actions.signal_receiver import SignalReceiver, Mode
+from actions.signal_receiver import SignalReceiver
+from modes import Mode
 from dedup import AlertDeduplicator
 from memory import MemoryManager
 

@@ -6,17 +6,11 @@ import logging
 import re
 import urllib.request
 import urllib.error
-from enum import Enum
 from typing import Optional
 
+from modes import Mode
+
 logger = logging.getLogger('ai-sre-agent.signal')
-
-
-class Mode(str, Enum):
-    """Agent operational modes."""
-    SRE = "SRE"
-    OPERATOR = "OPERATOR"
-    HOME = "HOME"
 
 # Try to import websockets
 try:
