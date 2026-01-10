@@ -26,6 +26,7 @@ from actions.notify import Notifier
 from actions.execute import Executor
 from actions.signal_receiver import SignalReceiver
 from dedup import AlertDeduplicator
+from memory import MemoryManager
 
 # Setup logging
 def setup_logging():
@@ -80,6 +81,9 @@ class SREAgent:
             state_file=Path('data/alert_state.json'),
             suppress_hours=dedup_config.get('suppress_hours', 2.0)
         )
+
+        # Memory manager for operator mode
+        self.memory = MemoryManager(working_dir=Path.cwd())
 
         # State
         self.plans_dir = Path('data/plans')
@@ -282,6 +286,31 @@ class SREAgent:
                 self.signal_receiver.send_help()
             elif action == 'chat':
                 self._handle_signal_chat(cmd.get('text', ''), cmd.get('raw_text', ''))
+            # Operator mode commands
+            elif action == 'operator_enter':
+                self._handle_operator_enter()
+            elif action == 'operator_exit':
+                self._handle_operator_exit()
+            elif action == 'operator_memory_show':
+                self._handle_operator_memory_show()
+            elif action == 'operator_memory_add':
+                self._handle_operator_memory_add(cmd.get('text', ''))
+            elif action == 'operator_memory_clear':
+                self._handle_operator_memory_clear()
+            elif action == 'operator_rules_list':
+                self._handle_operator_rules_list()
+            elif action == 'operator_rules_show':
+                self._handle_operator_rules_show(cmd.get('name', ''))
+            elif action == 'operator_rules_add':
+                self._handle_operator_rules_add(cmd.get('name', ''), cmd.get('content', ''))
+            elif action == 'operator_context':
+                self._handle_operator_context()
+            elif action == 'operator_reload':
+                self._handle_operator_reload()
+            elif action == 'operator_help':
+                self._handle_operator_help(cmd.get('topic'))
+            elif action == 'operator_unknown':
+                self.signal_receiver.send_response(f"❓ Unknown command: {cmd.get('text', '')}\nType 'help' for commands.")
 
     def _validate_issue_persists(self, plan: dict) -> tuple:
         """Check if the issue that triggered this plan still exists.
@@ -479,6 +508,141 @@ class SREAgent:
 
         # No matching plan found - might be reaction to other message
         logger.debug(f"Reaction {emoji} on timestamp {target_timestamp} doesn't match any pending plan")
+
+    # ========== Operator Mode Handlers ==========
+
+    def _handle_operator_enter(self):
+        """Enter operator mode."""
+        self.signal_receiver.send_response(
+            "🔧 Operator mode active.\n\n"
+            "Commands:\n"
+            "• memory show/add/clear\n"
+            "• rules list/show/add\n"
+            "• context\n"
+            "• reload\n"
+            "• exit\n\n"
+            "Type 'help' for details."
+        )
+
+    def _handle_operator_exit(self):
+        """Exit operator mode."""
+        self.signal_receiver.send_response("👋 Exited operator mode.")
+
+    def _handle_operator_memory_show(self):
+        """Show memory.md contents."""
+        content = self.memory.get_memory()
+        # Truncate if too long for Signal
+        if len(content) > 1500:
+            content = content[:1500] + "\n\n... (truncated)"
+        self.signal_receiver.send_response(f"📝 Memory:\n\n{content}")
+
+    def _handle_operator_memory_add(self, text: str):
+        """Add to memory."""
+        if not text:
+            self.signal_receiver.send_response("❌ Usage: memory add <text>")
+            return
+
+        if self.memory.add_memory(text):
+            self.signal_receiver.send_response(f"✅ Added to memory:\n{text}")
+        else:
+            self.signal_receiver.send_response("❌ Failed to add to memory")
+
+    def _handle_operator_memory_clear(self):
+        """Clear memory."""
+        if self.memory.clear_memory():
+            self.signal_receiver.send_response("🗑️ Memory cleared")
+        else:
+            self.signal_receiver.send_response("❌ Failed to clear memory")
+
+    def _handle_operator_rules_list(self):
+        """List rule files."""
+        rules = self.memory.list_rules()
+        if rules:
+            self.signal_receiver.send_response(
+                f"📋 Rules ({len(rules)}):\n" +
+                "\n".join(f"• {r}" for r in rules)
+            )
+        else:
+            self.signal_receiver.send_response("📋 No rule files found")
+
+    def _handle_operator_rules_show(self, name: str):
+        """Show a rule file."""
+        if not name:
+            self.signal_receiver.send_response("❌ Usage: rules show <name>")
+            return
+
+        content = self.memory.get_rule(name)
+        if content:
+            # Truncate if too long
+            if len(content) > 1500:
+                content = content[:1500] + "\n\n... (truncated)"
+            self.signal_receiver.send_response(f"📄 {name}.md:\n\n{content}")
+        else:
+            self.signal_receiver.send_response(f"❌ Rule '{name}' not found")
+
+    def _handle_operator_rules_add(self, name: str, content: str):
+        """Add to a rule file."""
+        if not name or not content:
+            self.signal_receiver.send_response("❌ Usage: rules add <name> <content>")
+            return
+
+        if self.memory.add_rule(name, content):
+            self.signal_receiver.send_response(f"✅ Added to {name}.md:\n{content}")
+        else:
+            self.signal_receiver.send_response("❌ Failed to add rule")
+
+    def _handle_operator_context(self):
+        """Show loaded context files."""
+        files = self.memory.get_context_files()
+        if files:
+            lines = [f"📂 Context files ({len(files)}):"]
+            for path, ftype in files:
+                lines.append(f"• [{ftype}] {path}")
+            self.signal_receiver.send_response("\n".join(lines))
+        else:
+            self.signal_receiver.send_response("📂 No context files loaded")
+
+    def _handle_operator_reload(self):
+        """Reload context files."""
+        # Reinitialize memory manager to reload files
+        self.memory = MemoryManager(working_dir=Path.cwd())
+        files = self.memory.get_context_files()
+        self.signal_receiver.send_response(f"🔄 Reloaded {len(files)} context files")
+
+    def _handle_operator_help(self, topic: str = None):
+        """Show operator mode help."""
+        if topic == 'memory':
+            self.signal_receiver.send_response(
+                "📝 Memory Commands:\n\n"
+                "• memory show - View learnings\n"
+                "• memory add <text> - Add a learning\n"
+                "• memory clear - Clear all"
+            )
+        elif topic == 'rules':
+            self.signal_receiver.send_response(
+                "📋 Rules Commands:\n\n"
+                "• rules list - List rule files\n"
+                "• rules show <name> - View a rule\n"
+                "• rules add <name> <content> - Add to rule"
+            )
+        else:
+            self.signal_receiver.send_response(
+                "🔧 Operator Mode Help\n\n"
+                "Memory:\n"
+                "• memory show - View learnings\n"
+                "• memory add <text> - Add learning\n"
+                "• memory clear - Clear all\n\n"
+                "Rules:\n"
+                "• rules list - List files\n"
+                "• rules show <name> - View rule\n"
+                "• rules add <name> <text> - Add to rule\n\n"
+                "Other:\n"
+                "• context - Show loaded files\n"
+                "• reload - Refresh context\n"
+                "• exit - Leave operator mode"
+            )
+
+    # ========== End Operator Mode Handlers ==========
 
     def _handle_signal_chat(self, message: str, raw_text: str = ''):
         """Process free-form message with Claude."""

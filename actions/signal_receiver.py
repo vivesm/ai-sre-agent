@@ -33,6 +33,9 @@ class SignalReceiver:
         # Convert http:// to ws:// for websocket URL
         self.ws_url = self.api_url.replace('http://', 'ws://').replace('https://', 'wss://')
 
+        # Operator mode state per sender
+        self.operator_mode = {}  # {sender_number: bool}
+
     def poll_messages(self) -> list:
         """
         Poll Signal API for incoming messages using websocket.
@@ -185,8 +188,8 @@ class SignalReceiver:
 
             logger.info(f"Received Signal message: {text[:50]}...")
 
-            # Parse the command
-            cmd = self._parse_command(text)
+            # Parse the command (pass sender for operator mode state)
+            cmd = self._parse_command(text, sender=sender)
             if cmd:
                 cmd['sender'] = sender
                 cmd['timestamp'] = timestamp
@@ -198,11 +201,12 @@ class SignalReceiver:
             logger.error(f"Failed to parse message: {e}")
             return None
 
-    def _parse_command(self, text: str) -> Optional[dict]:
+    def _parse_command(self, text: str, sender: str = None) -> Optional[dict]:
         """
         Parse command text into structured command.
 
         Supported commands:
+        - /operator - Enter operator mode
         - approve <plan_id> / yes <plan_id> / ok <plan_id>
         - reject <plan_id> / no <plan_id> / deny <plan_id>
         - status
@@ -210,11 +214,24 @@ class SignalReceiver:
 
         Args:
             text: Message text
+            sender: Sender phone number (for operator mode state)
 
         Returns:
             Command dict with 'action' and optional 'plan_id'
         """
-        text = text.lower().strip()
+        text_lower = text.lower().strip()
+        text_orig = text.strip()  # Keep original case for content
+
+        # Check for /operator command
+        if text_lower == '/operator':
+            self.operator_mode[sender] = True
+            return {'action': 'operator_enter', 'sender': sender}
+
+        # If in operator mode, parse operator commands
+        if sender and self.operator_mode.get(sender):
+            return self._parse_operator_command(text_orig, sender)
+
+        text = text_lower  # Use lowercase for normal commands
 
         # Approve patterns
         approve_match = re.match(r'^(approve|yes|ok|execute|run)\s+(\S+)', text)
@@ -257,6 +274,82 @@ class SignalReceiver:
         # Any other message - treat as chat for Claude
         logger.debug(f"Routing to chat: {text}")
         return {'action': 'chat', 'text': text}
+
+    def _parse_operator_command(self, text: str, sender: str) -> Optional[dict]:
+        """
+        Parse operator mode commands.
+
+        Operator commands:
+        - memory show - Display memory.md
+        - memory add <text> - Add to memory
+        - memory clear - Clear memory
+        - rules list - List rule files
+        - rules show <name> - Show a rule
+        - rules add <name> <content> - Add to a rule
+        - context - Show loaded context files
+        - reload - Reload context
+        - exit - Exit operator mode
+
+        Args:
+            text: Command text
+            sender: Sender phone number
+
+        Returns:
+            Command dict with 'action' and params
+        """
+        text = text.strip()
+        parts = text.split(maxsplit=2)
+        cmd = parts[0].lower() if parts else ''
+
+        # Exit operator mode
+        if cmd in ['exit', 'quit', 'done', 'back']:
+            self.operator_mode[sender] = False
+            return {'action': 'operator_exit', 'sender': sender}
+
+        # Memory commands
+        if cmd == 'memory':
+            subcmd = parts[1].lower() if len(parts) > 1 else 'show'
+
+            if subcmd == 'show':
+                return {'action': 'operator_memory_show'}
+            elif subcmd == 'add' and len(parts) > 2:
+                return {'action': 'operator_memory_add', 'text': parts[2]}
+            elif subcmd == 'clear':
+                return {'action': 'operator_memory_clear'}
+            else:
+                return {'action': 'operator_help', 'topic': 'memory'}
+
+        # Rules commands
+        if cmd == 'rules':
+            subcmd = parts[1].lower() if len(parts) > 1 else 'list'
+
+            if subcmd == 'list':
+                return {'action': 'operator_rules_list'}
+            elif subcmd == 'show' and len(parts) > 2:
+                return {'action': 'operator_rules_show', 'name': parts[2]}
+            elif subcmd == 'add' and len(parts) > 2:
+                # Format: rules add <name> <content>
+                # Content can have spaces, so split differently
+                rest = text[len('rules add '):].strip()
+                name_parts = rest.split(maxsplit=1)
+                if len(name_parts) == 2:
+                    return {'action': 'operator_rules_add', 'name': name_parts[0], 'content': name_parts[1]}
+            return {'action': 'operator_help', 'topic': 'rules'}
+
+        # Context command
+        if cmd == 'context':
+            return {'action': 'operator_context'}
+
+        # Reload command
+        if cmd == 'reload':
+            return {'action': 'operator_reload'}
+
+        # Help command (in operator mode)
+        if cmd in ['help', '?']:
+            return {'action': 'operator_help'}
+
+        # Unknown operator command
+        return {'action': 'operator_unknown', 'text': text}
 
     def send_response(self, message: str) -> bool:
         """
