@@ -482,7 +482,7 @@ class SREAgent:
         """Handle emoji reaction to a plan notification message.
 
         Args:
-            emoji: The reaction emoji (e.g., 👍, 👎)
+            emoji: The reaction emoji (e.g., 👍, 👎, 🔍)
             target_timestamp: Timestamp of the message being reacted to
         """
         if not target_timestamp:
@@ -492,6 +492,7 @@ class SREAgent:
         # Define emoji mappings
         approve_emojis = ['👍', '👌', '✅', '🚀', '💪', '🎉']
         reject_emojis = ['👎', '❌', '🚫', '⛔', '🛑']
+        investigate_emojis = ['🔍', '🔎']
 
         # Find plan by notification timestamp
         for plan_file in self.plans_dir.glob('*.json'):
@@ -509,6 +510,9 @@ class SREAgent:
                     elif emoji in reject_emojis:
                         self._handle_signal_reject(plan_id)
                         return
+                    elif emoji in investigate_emojis:
+                        self._handle_signal_investigate(plan)
+                        return
                     else:
                         # Unrecognized emoji on a plan message
                         logger.debug(f"Unrecognized reaction {emoji} on plan {plan_id}")
@@ -519,6 +523,60 @@ class SREAgent:
 
         # No matching plan found - might be reaction to other message
         logger.debug(f"Reaction {emoji} on timestamp {target_timestamp} doesn't match any pending plan")
+
+    def _handle_signal_investigate(self, plan: dict):
+        """Reinvestigate an issue and provide fresh analysis.
+
+        Args:
+            plan: The original plan dict to reinvestigate
+        """
+        plan_id = plan.get('plan_id')
+        original_summary = plan.get('summary', 'Unknown issue')
+        logger.info(f"Reinvestigating plan {plan_id}: {original_summary}")
+
+        # Acknowledge the request
+        self.signal_receiver.send_response(
+            f"🔍 Reinvestigating: {original_summary[:50]}...",
+            mode=Mode.SRE
+        )
+
+        # Collect fresh evidence
+        evidence = self.collect_evidence()
+
+        # Check if there are current issues
+        current_issues = evidence.get('issues', [])
+
+        if not current_issues:
+            # Issue resolved
+            self.reject_plan(plan_id, reason="Issue resolved - reinvestigation found no problems")
+            self.signal_receiver.send_response(
+                f"🔎 Reinvestigation complete:\n\n"
+                f"✨ Good news! The issue appears resolved.\n"
+                f"Plan {plan_id} dismissed.",
+                mode=Mode.SRE
+            )
+            return
+
+        # Re-analyze with Claude, mentioning the original issue
+        new_plan = self.analyze_and_plan(evidence)
+
+        if new_plan:
+            # Cancel old plan and replace with new one
+            self.reject_plan(plan_id, reason=f"Superseded by reinvestigation: {new_plan.get('plan_id')}")
+
+            # Save and notify about the new plan
+            self.save_plan(new_plan)
+            self.notify_user(new_plan)
+
+            logger.info(f"Reinvestigation produced new plan: {new_plan.get('plan_id')}")
+        else:
+            # Analysis didn't produce a plan (might be info-only issues)
+            self.signal_receiver.send_response(
+                f"🔎 Reinvestigation complete:\n\n"
+                f"Current issues detected but no action required.\n"
+                f"Original plan {plan_id} remains pending.",
+                mode=Mode.SRE
+            )
 
     # ========== Operator Mode Handlers ==========
 

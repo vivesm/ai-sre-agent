@@ -466,9 +466,9 @@ class SignalReceiver:
 • status - List all pending plans
 • help - Show this message
 
-Modes: /sre, /operator, /home
+Reactions: 👍 approve, 👎 reject, 🔍 reinvestigate
 
-Shortcuts: yes/ok (approve), no/deny (reject)"""
+Modes: /sre, /operator, /home"""
 
         return self.send_response(help_text, mode=mode or Mode.SRE)
 
