@@ -127,7 +127,12 @@ Or reply: "approve" / "reject" / "status\""""
         summary = plan.get('summary', 'Unknown issue')
         result = plan.get('result', {})
 
-        if status == 'completed':
+        # Check if this was a dry-run (no actual execution)
+        if result.get('dry_run'):
+            title = f"[DRY-RUN] {summary}"
+            body = f"Plan {plan_id} approved but NOT executed (dry-run mode)."
+            signal_message = f"🧪 {title}\n\nPlan {plan_id} approved.\n⚠️ Dry-run mode - no actions taken."
+        elif status == 'completed':
             title = f"[FIXED] {summary}"
             body = f"Plan {plan_id} executed successfully."
             signal_message = f"✅ {title}\n\nPlan {plan_id} executed successfully."

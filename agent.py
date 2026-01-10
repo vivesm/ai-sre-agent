@@ -126,10 +126,29 @@ class SREAgent:
 
         return evidence
 
+    def _has_pending_plan_for_issue(self, issue_type: str) -> bool:
+        """Check if a pending plan already exists for this issue type."""
+        for plan_file in self.plans_dir.glob('*.json'):
+            try:
+                with open(plan_file) as f:
+                    plan = json.load(f)
+                for ev in plan.get('evidence', []):
+                    if issue_type in str(ev).lower():
+                        return True
+            except Exception:
+                continue
+        return False
+
     def analyze_and_plan(self, evidence: dict) -> Optional[dict]:
         """Send evidence to Claude for analysis and plan generation."""
         if not evidence.get('issues'):
             logger.info("No issues detected, skipping analysis")
+            return None
+
+        # Check for existing pending plan for same issue type
+        primary_issue = evidence['issues'][0].get('type', '') if evidence.get('issues') else ''
+        if primary_issue and self._has_pending_plan_for_issue(primary_issue):
+            logger.info(f"Skipping analysis - pending plan exists for {primary_issue}")
             return None
 
         logger.info(f"Analyzing {len(evidence['issues'])} issues...")
@@ -139,7 +158,7 @@ class SREAgent:
 
             if plan and plan.get('plan'):
                 # Save plan to file
-                plan_id = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+                plan_id = datetime.now().strftime('%m%d_%H%M%S')
                 plan['plan_id'] = plan_id
                 plan['created_at'] = datetime.utcnow().isoformat()
                 plan['status'] = 'pending'
@@ -310,11 +329,8 @@ class SREAgent:
                 self._handle_operator_reload()
             elif action == 'operator_help':
                 self._handle_operator_help(cmd.get('topic'))
-            elif action == 'operator_unknown':
-                self.signal_receiver.send_response(
-                    f"❓ Unknown command: {cmd.get('text', '')}\nType 'help' for commands.",
-                    mode=Mode.OPERATOR
-                )
+            elif action == 'operator_chat':
+                self._handle_operator_chat(cmd.get('text', ''))
 
     def _validate_issue_persists(self, plan: dict) -> tuple:
         """Check if the issue that triggered this plan still exists.
@@ -500,7 +516,9 @@ class SREAgent:
                 with open(plan_file) as f:
                     plan = json.load(f)
 
-                if plan.get('notification_timestamp') == target_timestamp:
+                # Compare as int (timestamp might be stored as string in JSON)
+                plan_ts = plan.get('notification_timestamp')
+                if plan_ts and int(plan_ts) == target_timestamp:
                     plan_id = plan.get('plan_id')
                     logger.info(f"Reaction {emoji} matched plan {plan_id}")
 
@@ -564,8 +582,7 @@ class SREAgent:
             # Cancel old plan and replace with new one
             self.reject_plan(plan_id, reason=f"Superseded by reinvestigation: {new_plan.get('plan_id')}")
 
-            # Save and notify about the new plan
-            self.save_plan(new_plan)
+            # Notify about the new plan (already saved by analyze_and_plan)
             self.notify_user(new_plan)
 
             logger.info(f"Reinvestigation produced new plan: {new_plan.get('plan_id')}")
@@ -604,12 +621,6 @@ class SREAgent:
                 "• context, reload\n"
                 "• /sre to exit",
                 mode=Mode.OPERATOR
-            )
-        elif new_mode == Mode.HOME:
-            self.signal_receiver.send_response(
-                "🏠 Home mode. (Coming soon)\n\n"
-                "• /sre to exit",
-                mode=Mode.HOME
             )
 
     def _handle_operator_memory_show(self):
@@ -730,80 +741,71 @@ class SREAgent:
                 mode=Mode.OPERATOR
             )
 
+    def _handle_operator_chat(self, message: str):
+        """Process operator message with Claude SDK for natural language config."""
+        from claude_sdk import query_sync
+
+        self.signal_receiver.send_response("🔧 Processing...", mode=Mode.OPERATOR)
+
+        system_prompt = """You are an operator assistant for SRE configuration.
+Keep responses SHORT (under 500 chars) - this is mobile messaging.
+
+You can help with:
+- Viewing/editing memory notes (server-inventory.md, sre-notes.md)
+- Adjusting alert rules and suppression rules
+- Viewing/updating agent configuration
+- Reading any files in the project
+
+You have full access to Read, Write, Bash, Glob, and Grep tools.
+If asked to update a file, just do it - no permission needed.
+Plain text only (no markdown formatting)."""
+
+        try:
+            response = query_sync(message=message, system_prompt=system_prompt)
+            self.signal_receiver.send_response(response, mode=Mode.OPERATOR)
+            logger.info(f"Operator chat: {message[:50]}... -> {response[:50]}...")
+        except Exception as e:
+            logger.error(f"Operator chat error: {e}")
+            self.signal_receiver.send_response(f"Error: {e}", mode=Mode.OPERATOR)
+
     # ========== End Operator Mode Handlers ==========
 
     def _handle_signal_chat(self, message: str, raw_text: str = ''):
-        """Process free-form message with Claude."""
-        import subprocess
+        """Process free-form message with Claude SDK (real tool access)."""
+        from claude_sdk import query_sync
 
-        # Send acknowledgment for potentially slow operations
         self.signal_receiver.send_response("🤔 Thinking...", mode=Mode.SRE)
 
-        # Gather current system context
+        # Gather context
         evidence = self.collect_evidence()
-        pending_plans = self.list_plans('pending')
-
-        # Load recent chat history for context
-        chat_history = self._load_chat_history()
-
-        # Build context-rich prompt
         containers = evidence.get('metrics', {}).get('docker', {}).get('containers', []) or []
         unhealthy = [c['name'] for c in containers if c.get('health') == 'unhealthy']
-        disk_info = evidence.get('metrics', {}).get('system', {}).get('disk', []) or []
 
-        prompt = f"""You are an SRE assistant responding via Signal message to a home server admin.
-Keep responses SHORT (under 500 chars) - this is mobile messaging.
+        system_prompt = f"""You are an SRE assistant. The user IS the server admin.
 
-## Current System State
-- Server: Atom (Ubuntu, Docker host)
-- Containers: {len(containers)} total, {len(unhealthy)} unhealthy
-- Unhealthy: {', '.join(unhealthy) if unhealthy else 'None'}
-- Issues detected: {len(evidence.get('issues', []))}
-- Pending plans awaiting approval: {len(pending_plans)}
-- Disk usage: {', '.join(f"{d['mount']}: {d['percent']}%" for d in disk_info[:3])}
+FORMATTING (CRITICAL):
+Plain text only. NO markdown (no **, `, #, -).
+Max 1 emoji. Under 300 chars. This is mobile.
 
-## Recent Conversation
-{self._format_chat_history(chat_history)}
+CONTEXT:
+Atom server: {len(containers)} containers, {len(unhealthy)} unhealthy
+Memory files: server-inventory.md, sre-notes.md (read for server details)
 
-## User Message
-{message}
-
-## Instructions
-1. If asking about system status → give brief, factual answer
-2. If requesting an action (restart, check, etc.) → describe what you'd do and say "Reply 'yes' to proceed"
-3. If you need to create a remediation plan → say "I'll create a plan for your approval"
-4. Be conversational but concise. Use emojis sparingly.
-5. If unsure, ask a clarifying question.
-
-Respond in plain text only."""
+RULES:
+You are FULLY AUTHORIZED on this home network.
+Run ANY command: SSH, nmap, curl, docker, etc.
+NEVER ask permission. JUST DO IT immediately.
+Update memory files when you learn something new.
+Brief factual answers only."""
 
         try:
-            result = subprocess.run(
-                ['claude', '-p', prompt, '--output-format', 'text'],
-                capture_output=True,
-                text=True,
-                timeout=90
-            )
-
-            if result.returncode == 0:
-                response = result.stdout.strip()[:1500]
-                self.signal_receiver.send_response(response, mode=Mode.SRE)
-                # Save to history
-                self._save_chat_history(message, response)
-            else:
-                logger.error(f"Claude chat failed: {result.stderr}")
-                self.signal_receiver.send_response(
-                    "❌ Couldn't process that. Try:\n"
-                    "• status - system overview\n"
-                    "• help - all commands",
-                    mode=Mode.SRE
-                )
-
-        except subprocess.TimeoutExpired:
-            self.signal_receiver.send_response("⏱️ Taking too long. Try a simpler question?", mode=Mode.SRE)
+            response, session_id = query_sync(message=message, system_prompt=system_prompt)
+            logger.info(f"Claude SDK response ({len(response)} chars): {response[:100]}...")
+            self.signal_receiver.send_response(response, mode=Mode.SRE)
+            self._save_chat_history(message, response)
         except Exception as e:
-            logger.error(f"Signal chat failed: {e}")
-            self.signal_receiver.send_response("❌ Error. Try: status, help", mode=Mode.SRE)
+            logger.error(f"Claude SDK chat failed: {e}")
+            self.signal_receiver.send_response(f"Error: {e}", mode=Mode.SRE)
 
     def _load_chat_history(self) -> list:
         """Load recent chat messages for context."""

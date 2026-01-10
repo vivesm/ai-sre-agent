@@ -3,7 +3,7 @@
 
 agent:
   name: "Atom SRE Agent"
-  check_interval: 900  # 15 minutes
+  check_interval: 3600  # 1 hour
   dry_run: true  # Start in dry-run mode for safety
 
   # Alert deduplication to prevent spam

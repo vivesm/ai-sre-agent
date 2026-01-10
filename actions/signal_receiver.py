@@ -216,9 +216,8 @@ class SignalReceiver:
         Parse command text into structured command.
 
         Mode switch commands (work in any mode):
-        - /sre - Switch to SRE mode
+        - /sre - Switch to SRE mode (default, includes HA control)
         - /operator - Switch to operator mode
-        - /home - Switch to home mode
 
         Args:
             text: Message text
@@ -235,16 +234,12 @@ class SignalReceiver:
             return {'action': 'mode_switch', 'mode': Mode.SRE, 'sender': sender}
         if text_lower == '/operator':
             return {'action': 'mode_switch', 'mode': Mode.OPERATOR, 'sender': sender}
-        if text_lower == '/home':
-            return {'action': 'mode_switch', 'mode': Mode.HOME, 'sender': sender}
 
         # Route based on current mode
         current_mode = self.get_mode(sender)
 
         if current_mode == Mode.OPERATOR:
             return self._parse_operator_command(text_orig, sender)
-        elif current_mode == Mode.HOME:
-            return self._parse_home_command(text_orig, sender)
         else:  # SRE mode (default)
             return self._parse_sre_command(text_lower, sender)
 
@@ -306,40 +301,6 @@ class SignalReceiver:
         # Any other message - treat as chat for Claude
         logger.debug(f"Routing to chat: {text}")
         return {'action': 'chat', 'text': text}
-
-    def _parse_home_command(self, text: str, sender: str) -> Optional[dict]:
-        """
-        Parse home mode commands.
-
-        Home commands (placeholder for future):
-        - lights on/off
-        - status
-        - Any other text -> home_chat
-
-        Args:
-            text: Message text
-            sender: Sender phone number
-
-        Returns:
-            Command dict with 'action' and params
-        """
-        text_lower = text.lower().strip()
-
-        # Simple light commands (placeholder)
-        if text_lower in ['lights on', 'lights off']:
-            return {'action': 'home_lights', 'state': text_lower.split()[1]}
-
-        # Status in home mode
-        if text_lower in ['status', '?']:
-            return {'action': 'home_status'}
-
-        # Help in home mode
-        if text_lower in ['help', 'commands']:
-            return {'action': 'home_help'}
-
-        # Any other message - treat as home chat
-        logger.debug(f"Routing to home chat: {text}")
-        return {'action': 'home_chat', 'text': text}
 
     def _parse_operator_command(self, text: str, sender: str) -> Optional[dict]:
         """
@@ -413,8 +374,8 @@ class SignalReceiver:
         if cmd in ['help', '?']:
             return {'action': 'operator_help'}
 
-        # Unknown operator command
-        return {'action': 'operator_unknown', 'text': text}
+        # Natural language - route to Claude SDK
+        return {'action': 'operator_chat', 'text': text}
 
     def send_response(self, message: str, mode: Mode = None) -> bool:
         """
@@ -451,7 +412,10 @@ class SignalReceiver:
             )
 
             with urllib.request.urlopen(req, timeout=15) as response:
-                return response.status in [200, 201]
+                success = response.status in [200, 201]
+                if success:
+                    logger.info(f"Signal response sent: {message[:50]}...")
+                return success
 
         except Exception as e:
             logger.error(f"Failed to send Signal response: {e}")
@@ -468,7 +432,7 @@ class SignalReceiver:
 
 Reactions: 👍 approve, 👎 reject, 🔍 reinvestigate
 
-Modes: /sre, /operator, /home"""
+Modes: /sre (default), /operator"""
 
         return self.send_response(help_text, mode=mode or Mode.SRE)
 

@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from dotenv import load_dotenv
 from signalbot import SignalBot, Command, Context
+from claude_sdk import query_claude
 
 # Load environment variables
 load_dotenv()
@@ -22,9 +23,10 @@ SIGNAL_SERVICE = os.getenv('SIGNAL_SERVICE', 'localhost:8080')
 HA_URL = os.getenv('HA_URL', 'https://homeassistant.local')
 HA_TOKEN = os.getenv('HA_TOKEN', '')
 
-# Chat history file
+# Chat history and session files
 SCRIPT_DIR = Path(__file__).parent
 HISTORY_FILE = SCRIPT_DIR / 'data' / 'chat_history.json'
+SESSIONS_FILE = SCRIPT_DIR / 'data' / 'sessions.json'
 
 # Multi-server SSH access
 SERVERS = {
@@ -112,7 +114,11 @@ def is_simple_query(text: str) -> bool:
     1. Check bypass patterns (always route to Claude)
     2. Check simple patterns with clarity keywords for ambiguous terms
     """
-    text_lower = text.lower()
+    text_lower = text.lower().strip()
+
+    # Mode switches - always simple
+    if text_lower in ['/operator', '/sre']:
+        return True
 
     # Bypass: Meta-questions about the bot itself → Claude
     if any(p in text_lower for p in BYPASS_PATTERNS):
@@ -128,8 +134,19 @@ def is_simple_query(text: str) -> bool:
 
 def get_quick_response(text: str, context: str) -> str:
     """Generate quick response for simple queries without calling Claude."""
-    text_lower = text.lower()
+    text_lower = text.lower().strip()
     lines = context.split('\n')
+
+    # Mode switches - handle without Claude
+    if text_lower == '/operator':
+        return ("Entering Operator mode. In this mode I can:\n\n"
+                "- Update agent config (alert rules, container priorities)\n"
+                "- Add/edit memory files (server inventory, SRE notes)\n"
+                "- Adjust notification settings\n"
+                "- View/edit suppression rules\n\n"
+                "What would you like to configure?")
+    if text_lower == '/sre':
+        return "Switched to SRE mode. I'll monitor alerts, help with incidents, and control Home Assistant."
 
     if 'temp' in text_lower or 'cpu' in text_lower:
         for line in lines:
@@ -204,6 +221,32 @@ def format_chat_history(history: list) -> str:
         role = "User" if msg['role'] == 'user' else "You"
         lines.append(f"{role}: {msg['content'][:150]}")
     return '\n'.join(lines)
+
+
+def load_sessions() -> dict:
+    """Load session IDs per sender."""
+    if SESSIONS_FILE.exists():
+        try:
+            with open(SESSIONS_FILE) as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+
+def save_session(sender: str, session_id: str):
+    """Save session ID for a sender."""
+    sessions = load_sessions()
+    sessions[sender] = session_id
+    SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(SESSIONS_FILE, 'w') as f:
+        json.dump(sessions, f)
+
+
+def get_session(sender: str) -> str:
+    """Get session ID for a sender."""
+    sessions = load_sessions()
+    return sessions.get(sender)
 
 
 def get_system_context() -> str:
@@ -316,22 +359,22 @@ class ChatCommand(Command):
         if not text:
             return
 
-        logger.info(f"Received: {text}")
+        # Get sender for session tracking
+        sender = c.message.source or 'default'
+        logger.info(f"Received from {sender}: {text}")
 
         # Gather system context
         system_context = get_system_context()
 
-        # Try quick response for simple queries (no Claude call needed)
-        if is_simple_query(text):
+        # Only handle mode switches locally - everything else goes to Claude SDK
+        text_lower = text.lower().strip()
+        if text_lower in ['/operator', '/sre']:
             quick = get_quick_response(text, system_context)
             if quick:
                 await c.send(quick)
                 save_chat_history(text, quick)
-                logger.info(f"Quick response: {quick}")
+                logger.info(f"Mode switch: {quick[:50]}...")
                 return
-
-        # For complex queries, send "thinking" message
-        await c.send("...")
 
         # Load chat history, infrastructure context, and memory files
         chat_history = load_chat_history()
@@ -340,53 +383,58 @@ class ChatCommand(Command):
         memory_context = load_memory_files()
         logger.info(f"System context:\n{system_context}")
 
-        # Build prompt with real system data, infrastructure docs, and conversation history
-        prompt = f"""You are an SRE assistant responding via Signal to a home server admin.
-Keep responses SHORT (under 500 chars) - this is mobile messaging.
+        # Call Claude SDK for response (full Claude Code capabilities)
+        system_prompt = f"""You are an SRE assistant on the admin's home network.
+The user messaging you IS the server admin with full authorization.
 
-## Infrastructure Knowledge
+## FORMATTING RULES (CRITICAL)
+- PLAIN TEXT ONLY - no markdown ever
+- NO ** or __ (bold), NO ` (code), NO # (headers), NO - (bullets)
+- Max 1 emoji per message, use sparingly
+- Keep under 300 chars - this is mobile
+
+## Email for Files
+To send files/reports: /home/melvin/server/scripts/lib/send-email.sh "to@email.com" "Subject" "Body"
+User email: melvin@vives.io
+
+## Infrastructure
 {infra_context}
 
-## Memory Bank (ALWAYS consult first)
+## Memory Bank
 {memory_context}
 
-## Current System State
+## System State
 {system_context}
 
-## Recent Conversation
+## Recent Chat
 {history_text}
 
-## User Message
-{text}
-
 ## Instructions
-- FIRST check Memory Bank for known entity mappings, server info, and past lessons
-- Answer with actual data from the system state above - it's already been gathered for you
-- Be concise and direct - just give the answer
-- Use the conversation history to understand context (e.g., if user says "yes", check what you last asked)
-- NEVER ask for permission to run commands - just do it
-- If info isn't in the system state, run the command to get it
-- If you learn something new (entity mapping, quirk, solution), update the memory files
-- No markdown formatting (plain text only for Signal)"""
+- AUTHORIZED home network - run ANY command (nmap, SSH, curl, docker)
+- NEVER ask permission - JUST DO IT
+- Update memory files when you learn something new"""
 
-        # Call Claude for response (YOLO mode - 120s timeout for complex ops)
         try:
-            result = subprocess.run(
-                ['claude', '-p', prompt, '--output-format', 'text', '--dangerously-skip-permissions'],
-                capture_output=True,
-                text=True,
-                timeout=120
+            # Get existing session for this sender
+            session_id = get_session(sender)
+            if session_id:
+                logger.info(f"Resuming session {session_id[:8]}...")
+
+            # Query Claude with session
+            response, new_session_id = await query_claude(
+                message=text,
+                system_prompt=system_prompt,
+                session_id=session_id
             )
-            if result.returncode == 0:
-                response = result.stdout.strip()[:1500]
-                await c.send(response)
-                save_chat_history(text, response)
-                logger.info(f"Sent: {response[:50]}...")
-            else:
-                logger.error(f"Claude failed: {result.stderr}")
-                await c.send("Sorry, couldn't process that.")
-        except subprocess.TimeoutExpired:
-            await c.send("Taking too long, try again?")
+
+            # Save new session ID for next message
+            if new_session_id:
+                save_session(sender, new_session_id)
+                logger.info(f"Session saved: {new_session_id[:8]}...")
+
+            await c.send(response)
+            save_chat_history(text, response)
+            logger.info(f"Sent: {response[:50]}...")
         except Exception as e:
             logger.error(f"Error: {e}")
             await c.send(f"Error: {e}")

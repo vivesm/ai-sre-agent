@@ -75,7 +75,9 @@ class ClaudeAnalyzer:
 
     def __init__(self, config: dict):
         self.config = config
-        self.command = config.get('command', 'claude')
+        # Use full path since NVM isn't loaded in daemon mode
+        default_claude = '/home/melvin/.nvm/versions/node/v20.19.6/bin/claude'
+        self.command = config.get('command', default_claude)
         self.timeout = config.get('timeout', 120)
         self.model = config.get('model', None)  # Use default
 

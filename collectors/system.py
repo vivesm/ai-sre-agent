@@ -202,13 +202,22 @@ class SystemCollector:
             return []
 
     def _check_network(self) -> bool:
-        """Check network connectivity."""
-        try:
-            # Try to ping Google DNS
-            result = subprocess.run(
-                ['ping', '-c', '1', '-W', '5', '8.8.8.8'],
-                capture_output=True, timeout=10
-            )
-            return result.returncode == 0
-        except Exception:
-            return False
+        """Check network connectivity with multiple targets.
+
+        Tries multiple DNS providers to avoid false positives from
+        a single dropped packet or slow host.
+        """
+        targets = ['8.8.8.8', '1.1.1.1', '9.9.9.9']
+
+        for target in targets:
+            try:
+                result = subprocess.run(
+                    ['ping', '-c', '2', '-W', '3', target],
+                    capture_output=True, timeout=10
+                )
+                if result.returncode == 0:
+                    return True  # Any target reachable = network OK
+            except Exception:
+                continue
+
+        return False  # All targets failed

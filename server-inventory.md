@@ -36,14 +36,33 @@ Last updated: 2026-01-09
 - **Type:** Synology NAS
 - **Memory:** 62GB total
 - **Role:** Network storage, media server
-- **Access:** ssh tesseract (currently unreachable via that hostname)
+- **IP:** 192.168.4.56 (different subnet!)
+- **Access:** ssh melvin@192.168.4.56 (port 22, tesseract.local doesn't resolve)
 - **Notes:**
   - System partition (2.3GB) runs tight at 81%
   - Main storage on /volume1
-  - May need alternate hostname/IP for SSH
+  - On 192.168.4.x subnet (not 192.168.7.x like Atom)
 
 ## Network Overview
 - All servers on 192.168.7.x subnet
 - Guest WiFi isolated on 192.168.50.x
 - Caddy reverse proxy on Atom handles external access
 - Authelia 2FA at auth.vives.io
+
+## Projects & Documentation
+
+For detailed context on any project, read its CLAUDE.md file.
+
+### Web Applications
+- **home.vives.io** (Home Assistant): `/home/melvin/server/home.vives.io/CLAUDE.md`
+- **love.vives.io** (Relationship Quest): `/docker/webdav/vault/ObsidianVault/Projects/love.vives.io/CLAUDE.md`
+- **share.vives.io** (TextShare): `/home/melvin/server/share.vives.io/textshare/CLAUDE.md`
+- **wellness.vives.io**: `/docker/webdav/vault/ObsidianVault/Projects/wellness.vives.io/CLAUDE.md`
+- **todo.vives.io** (FamilyToDo): `/docker/webdav/vault/ObsidianVault/Projects/todo.vives.io/FamilyToDo/CLAUDE.md`
+
+### Infrastructure
+- **ai-sre-agent** (this bot): `/home/melvin/server/ai-sre-agent/CLAUDE.md`
+- **atom server**: `/docker/webdav/vault/ObsidianVault/Infrastructure/01-servers/atom/CLAUDE.md`
+- **sbvps server**: `/docker/webdav/vault/ObsidianVault/Infrastructure/01-servers/sbvps/CLAUDE.md`
+- **atom-admin**: `/docker/webdav/vault/ObsidianVault/Projects/atom-admin/CLAUDE.md`
+- **atom-system**: `/docker/webdav/vault/ObsidianVault/Projects/atom-system/CLAUDE.md`

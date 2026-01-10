@@ -16,14 +16,12 @@
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                      signal_chat.py                              │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
-│  │ Quick       │  │ Claude      │  │ Context Providers       │  │
-│  │ Response    │  │ Integration │  │ - System metrics        │  │
-│  │ (no AI)     │  │ (complex)   │  │ - Chat history          │  │
-│  └─────────────┘  └─────────────┘  │ - CLAUDE.md files       │  │
-│                                     │ - HA API info           │  │
-│                                     │ - SSH server info       │  │
-│                                     └─────────────────────────┘  │
+│  ┌─────────────┐  ┌─────────────────────────────────────────┐   │
+│  │ Mode Switch │  │ Claude Agent SDK (claude_sdk.py)        │   │
+│  │ /sre        │  │ - Full Claude Code capabilities         │   │
+│  │ /operator   │  │ - Read, Write, Bash, Glob, Grep tools   │   │
+│  └─────────────┘  │ - SSH, HA REST API, autonomous ops      │   │
+│                   └─────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
                               │
          ┌────────────────────┼────────────────────┐
@@ -42,7 +40,7 @@
 
 **Responsibilities:**
 - Receive messages via signalbot library
-- Route to quick response or Claude
+- Route mode switches locally, everything else to Claude SDK
 - Send responses back to Signal
 
 **Key Functions:**
@@ -50,10 +48,23 @@
 |----------|---------|
 | `get_system_context()` | Gather CPU, memory, disk, containers, IP, uptime |
 | `load_claude_context()` | Read CLAUDE.md files for infrastructure knowledge |
-| `is_simple_query()` | Detect queries that don't need AI |
-| `get_quick_response()` | Answer simple queries from cached data |
+| `load_memory_files()` | Load server-inventory.md and sre-notes.md |
 | `load_chat_history()` | Load last 10 messages for context |
 | `save_chat_history()` | Persist conversation for continuity |
+
+### claude_sdk.py (Claude Agent SDK Wrapper)
+
+**Capabilities:**
+- Same tools as Claude Code: Read, Write, Bash, Glob, Grep
+- Autonomous file exploration and command execution
+- SSH to remote servers without manual configuration
+- No permission prompts (bypass mode)
+
+**Key Functions:**
+| Function | Purpose |
+|----------|---------|
+| `query_claude()` | Async function to send query with full tool access |
+| `query_sync()` | Sync wrapper for non-async contexts (agent.py) |
 
 ### Context Providers
 
@@ -66,57 +77,31 @@
 - Public IP: `curl ifconfig.me`
 - Uptime: `uptime -p`
 
+**Memory Files:**
+- `server-inventory.md` - Server specs and network info
+- `sre-notes.md` - Learnings and quirks
+
 **Infrastructure Knowledge:**
 - Reads CLAUDE.md from: `~/CLAUDE.md`, `~/server/CLAUDE.md`, `~/.claude/CLAUDE.md`
-- Extracts key sections (headers, emergency procedures, commands)
-- Limits to 800 chars per file to manage context
-
-### Quick Response Patterns
-
-Queries matching these patterns skip Claude entirely:
-- `status`, `temp`, `cpu`, `memory`, `disk`, `ip`, `uptime`, `containers`
-
-Benefits: <1 second response vs 5-30 seconds with Claude
-
-### Claude Integration
-
-**Invocation:**
-```bash
-claude -p "<prompt>" --output-format text --dangerously-skip-permissions
-```
-
-**Prompt Structure:**
-1. Infrastructure knowledge (from CLAUDE.md)
-2. Current system state (real metrics)
-3. Recent conversation (last 3 exchanges)
-4. User message
-5. Instructions (be concise, use data, no permission asking)
-
-**Timeout:** 120 seconds (for SSH operations)
 
 ## Data Flow
 
-### Simple Query Flow
+### Mode Switch Flow
 ```
-User: "cpu temp"
-  → is_simple_query() = True
-  → get_system_context()
-  → get_quick_response() extracts temp
-  → Response: "27.8°C"
-  → save_chat_history()
+User: "/operator"
+  → Local handler (no Claude)
+  → Response: "Entering Operator mode..."
 ```
 
-### Complex Query Flow
+### Query Flow (SDK)
 ```
 User: "what containers are unhealthy on sagan?"
-  → is_simple_query() = False
-  → send "..." thinking indicator
   → get_system_context()
   → load_claude_context()
+  → load_memory_files()
   → load_chat_history()
-  → Build prompt with all context
-  → claude -p "<prompt>" --dangerously-skip-permissions
-  → Claude SSHs to sagan, runs docker ps
+  → await query_claude(message, system_prompt)
+  → SDK uses Bash tool to SSH to sagan
   → Response sent to user
   → save_chat_history()
 ```
@@ -126,12 +111,20 @@ User: "what containers are unhealthy on sagan?"
 | Dependency | Purpose | Location |
 |------------|---------|----------|
 | signal-cli-rest-api | Signal protocol | sagan.local:8080 |
-| Claude Code CLI | AI responses | Local installation |
+| claude-agent-sdk | Full Claude Code tools | pip package |
+| Claude Code CLI | Backend for SDK | ~/.nvm/.../bin/claude |
 | Home Assistant | Device control | home.vives.io |
 | SSH | Remote servers | blackest.local, sagan.local |
+
+## Modes
+
+| Mode | Trigger | Purpose |
+|------|---------|---------|
+| SRE | `/sre` | Server monitoring, alerts, plans, HA control |
+| Operator | `/operator` | Config changes, memory edits |
 
 ## Open Source Patterns Referenced
 
 - **signalbot library:** [pypi.org/project/signalbot](https://pypi.org/project/signalbot/)
-- **Claude Code CLI patterns:** [Anthropic best practices](https://www.anthropic.com/engineering/claude-code-best-practices)
+- **Claude Agent SDK:** [claude-agent-sdk](https://pypi.org/project/claude-agent-sdk/)
 - **ChatOps patterns:** [claude-code-telegram](https://github.com/RichardAtCT/claude-code-telegram)
