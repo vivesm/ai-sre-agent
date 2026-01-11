@@ -35,17 +35,6 @@ class SignalReceiver:
         # Convert http:// to ws:// for websocket URL
         self.ws_url = self.api_url.replace('http://', 'ws://').replace('https://', 'wss://')
 
-        # User mode state per sender (defaults to SRE)
-        self.user_mode = {}  # {sender_number: Mode}
-
-    def get_mode(self, sender: str) -> Mode:
-        """Get current mode for a sender (defaults to SRE)."""
-        return self.user_mode.get(sender, Mode.SRE)
-
-    def set_mode(self, sender: str, mode: Mode):
-        """Set mode for a sender."""
-        self.user_mode[sender] = mode
-
     def poll_messages(self) -> list:
         """
         Poll Signal API for incoming messages using websocket.
@@ -198,8 +187,8 @@ class SignalReceiver:
 
             logger.info(f"Received Signal message: {text[:50]}...")
 
-            # Parse the command (pass sender for operator mode state)
-            cmd = self._parse_command(text, sender=sender)
+            # Parse the command
+            cmd = self._parse_command(text)
             if cmd:
                 cmd['sender'] = sender
                 cmd['timestamp'] = timestamp
@@ -211,171 +200,89 @@ class SignalReceiver:
             logger.error(f"Failed to parse message: {e}")
             return None
 
-    def _parse_command(self, text: str, sender: str = None) -> Optional[dict]:
+    def _parse_command(self, text: str) -> Optional[dict]:
         """
         Parse command text into structured command.
 
-        Mode switch commands (work in any mode):
-        - /sre - Switch to SRE mode (default, includes HA control)
-        - /operator - Switch to operator mode
+        All commands work in unified SRE mode:
+        - Alert commands: approve, reject, status
+        - Memory commands: memory show/add/clear
+        - Rules commands: rules list/show/add
+        - System commands: context, reload, help
+        - Natural language: routed to Claude chat
 
         Args:
             text: Message text
-            sender: Sender phone number (for mode state)
 
         Returns:
             Command dict with 'action' and optional params
         """
-        text_lower = text.lower().strip()
-        text_orig = text.strip()  # Keep original case for content
-
-        # Mode switch commands (work from any mode)
-        if text_lower == '/sre':
-            return {'action': 'mode_switch', 'mode': Mode.SRE, 'sender': sender}
-        if text_lower == '/operator':
-            return {'action': 'mode_switch', 'mode': Mode.OPERATOR, 'sender': sender}
-
-        # Route based on current mode
-        current_mode = self.get_mode(sender)
-
-        if current_mode == Mode.OPERATOR:
-            return self._parse_operator_command(text_orig, sender)
-        else:  # SRE mode (default)
-            return self._parse_sre_command(text_lower, sender)
-
-    def _parse_sre_command(self, text: str, sender: str) -> Optional[dict]:
-        """
-        Parse SRE mode commands.
-
-        SRE commands:
-        - approve <plan_id> / yes <plan_id> / ok <plan_id>
-        - reject <plan_id> / no <plan_id> / deny <plan_id>
-        - status / ?
-        - help
-
-        Args:
-            text: Lowercase message text
-            sender: Sender phone number
-
-        Returns:
-            Command dict with 'action' and optional 'plan_id'
-        """
-        # Approve patterns
-        approve_match = re.match(r'^(approve|yes|ok|execute|run)\s+(\S+)', text)
-        if approve_match:
-            return {
-                'action': 'approve',
-                'plan_id': approve_match.group(2)
-            }
-
-        # Just "approve" or "yes" without plan_id (approve most recent)
-        if text in ['approve', 'yes', 'ok', 'execute', 'run']:
-            return {
-                'action': 'approve',
-                'plan_id': None  # Will approve most recent pending plan
-            }
-
-        # Reject patterns
-        reject_match = re.match(r'^(reject|no|deny|cancel|skip)\s+(\S+)', text)
-        if reject_match:
-            return {
-                'action': 'reject',
-                'plan_id': reject_match.group(2)
-            }
-
-        # Just "reject" or "no" without plan_id
-        if text in ['reject', 'no', 'deny', 'cancel', 'skip']:
-            return {
-                'action': 'reject',
-                'plan_id': None  # Will reject most recent pending plan
-            }
-
-        # Status command
-        if text in ['status', 'pending', 'list', 'plans', '?']:
-            return {'action': 'status'}
-
-        # Help command
-        if text in ['help', 'commands']:
-            return {'action': 'help'}
-
-        # Any other message - treat as chat for Claude
-        logger.debug(f"Routing to chat: {text}")
-        return {'action': 'chat', 'text': text}
-
-    def _parse_operator_command(self, text: str, sender: str) -> Optional[dict]:
-        """
-        Parse operator mode commands.
-
-        Operator commands:
-        - memory show - Display memory.md
-        - memory add <text> - Add to memory
-        - memory clear - Clear memory
-        - rules list - List rule files
-        - rules show <name> - Show a rule
-        - rules add <name> <content> - Add to a rule
-        - context - Show loaded context files
-        - reload - Reload context
-        - exit - Exit operator mode
-
-        Args:
-            text: Command text
-            sender: Sender phone number
-
-        Returns:
-            Command dict with 'action' and params
-        """
-        text = text.strip()
-        parts = text.split(maxsplit=2)
+        text_orig = text.strip()
+        text_lower = text_orig.lower()
+        parts = text_orig.split(maxsplit=2)
         cmd = parts[0].lower() if parts else ''
 
-        # Exit operator mode (switch back to SRE)
-        if cmd in ['exit', 'quit', 'done', 'back']:
-            return {'action': 'mode_switch', 'mode': Mode.SRE, 'sender': sender}
+        # Approve patterns
+        approve_match = re.match(r'^(approve|yes|ok|execute|run)\s+(\S+)', text_lower)
+        if approve_match:
+            return {'action': 'approve', 'plan_id': approve_match.group(2)}
+
+        if text_lower in ['approve', 'yes', 'ok', 'execute', 'run']:
+            return {'action': 'approve', 'plan_id': None}
+
+        # Reject patterns
+        reject_match = re.match(r'^(reject|no|deny|cancel|skip)\s+(\S+)', text_lower)
+        if reject_match:
+            return {'action': 'reject', 'plan_id': reject_match.group(2)}
+
+        if text_lower in ['reject', 'no', 'deny', 'cancel', 'skip']:
+            return {'action': 'reject', 'plan_id': None}
+
+        # Status command
+        if text_lower in ['status', 'pending', 'list', 'plans', '?']:
+            return {'action': 'status'}
 
         # Memory commands
         if cmd == 'memory':
             subcmd = parts[1].lower() if len(parts) > 1 else 'show'
-
             if subcmd == 'show':
-                return {'action': 'operator_memory_show'}
+                return {'action': 'memory_show'}
             elif subcmd == 'add' and len(parts) > 2:
-                return {'action': 'operator_memory_add', 'text': parts[2]}
+                return {'action': 'memory_add', 'text': parts[2]}
             elif subcmd == 'clear':
-                return {'action': 'operator_memory_clear'}
+                return {'action': 'memory_clear'}
             else:
-                return {'action': 'operator_help', 'topic': 'memory'}
+                return {'action': 'help', 'topic': 'memory'}
 
         # Rules commands
         if cmd == 'rules':
             subcmd = parts[1].lower() if len(parts) > 1 else 'list'
-
             if subcmd == 'list':
-                return {'action': 'operator_rules_list'}
+                return {'action': 'rules_list'}
             elif subcmd == 'show' and len(parts) > 2:
-                return {'action': 'operator_rules_show', 'name': parts[2]}
+                return {'action': 'rules_show', 'name': parts[2]}
             elif subcmd == 'add' and len(parts) > 2:
-                # Format: rules add <name> <content>
-                # Content can have spaces, so split differently
-                rest = text[len('rules add '):].strip()
+                rest = text_orig[len('rules add '):].strip()
                 name_parts = rest.split(maxsplit=1)
                 if len(name_parts) == 2:
-                    return {'action': 'operator_rules_add', 'name': name_parts[0], 'content': name_parts[1]}
-            return {'action': 'operator_help', 'topic': 'rules'}
+                    return {'action': 'rules_add', 'name': name_parts[0], 'content': name_parts[1]}
+            return {'action': 'help', 'topic': 'rules'}
 
         # Context command
         if cmd == 'context':
-            return {'action': 'operator_context'}
+            return {'action': 'context'}
 
         # Reload command
         if cmd == 'reload':
-            return {'action': 'operator_reload'}
+            return {'action': 'reload'}
 
-        # Help command (in operator mode)
-        if cmd in ['help', '?']:
-            return {'action': 'operator_help'}
+        # Help command
+        if cmd in ['help', 'commands']:
+            return {'action': 'help'}
 
-        # Natural language - route to Claude SDK
-        return {'action': 'operator_chat', 'text': text}
+        # Natural language - route to Claude chat
+        logger.debug(f"Routing to chat: {text_lower}")
+        return {'action': 'chat', 'text': text_lower}
 
     def send_response(self, message: str, mode: Mode = None) -> bool:
         """
@@ -383,7 +290,7 @@ class SignalReceiver:
 
         Args:
             message: Response text to send
-            mode: Optional mode to prefix message with (e.g., [SRE], [OPERATOR])
+            mode: Optional mode to prefix message with
 
         Returns:
             True if sent successfully
@@ -425,14 +332,29 @@ class SignalReceiver:
         """Send help message with available commands."""
         help_text = """🤖 SRE Agent Commands:
 
-• approve [plan_id] - Execute a pending plan
-• reject [plan_id] - Dismiss a pending plan
-• status - List all pending plans
+Alerts:
+• approve [id] - Execute plan
+• reject [id] - Dismiss plan
+• status - List pending plans
+
+Memory:
+• memory show - Display memory
+• memory add <text> - Add note
+• memory clear - Clear memory
+
+Rules:
+• rules list - List rules
+• rules show <name> - View rule
+• rules add <name> <text> - Add to rule
+
+System:
+• context - Show loaded files
+• reload - Refresh context
 • help - Show this message
 
 Reactions: 👍 approve, 👎 reject, 🔍 reinvestigate
 
-Modes: /sre (default), /operator"""
+Just chat naturally for device control or questions!"""
 
         return self.send_response(help_text, mode=mode or Mode.SRE)
 

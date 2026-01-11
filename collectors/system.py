@@ -202,22 +202,30 @@ class SystemCollector:
             return []
 
     def _check_network(self) -> bool:
-        """Check network connectivity with multiple targets.
+        """Check network connectivity using TCP connection test.
 
-        Tries multiple DNS providers to avoid false positives from
-        a single dropped packet or slow host.
+        Uses TCP connection to port 53 (DNS) which doesn't require
+        special capabilities, avoiding issues with systemd NoNewPrivileges.
         """
-        targets = ['8.8.8.8', '1.1.1.1', '9.9.9.9']
+        import socket
+        import logging
+        logger = logging.getLogger('ai-sre-agent.netcheck')
 
-        for target in targets:
+        # DNS servers with port 53 (TCP)
+        targets = [('8.8.8.8', 53), ('1.1.1.1', 53), ('9.9.9.9', 53)]
+
+        for host, port in targets:
             try:
-                result = subprocess.run(
-                    ['ping', '-c', '2', '-W', '3', target],
-                    capture_output=True, timeout=10
-                )
-                if result.returncode == 0:
-                    return True  # Any target reachable = network OK
-            except Exception:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(3)
+                result = sock.connect_ex((host, port))
+                sock.close()
+                if result == 0:
+                    logger.debug(f"TCP connect to {host}:{port} succeeded")
+                    return True
+            except Exception as e:
+                logger.debug(f"TCP connect to {host}:{port} failed: {e}")
                 continue
 
-        return False  # All targets failed
+        logger.warning("All network targets failed - reporting network_down")
+        return False

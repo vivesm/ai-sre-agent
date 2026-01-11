@@ -3,10 +3,8 @@ from enum import Enum
 
 
 class Mode(str, Enum):
-    """Agent operational modes.
+    """Agent operational mode.
 
-    SRE: Default monitoring mode (alerts, approvals, status, HA control)
-    OPERATOR: Configuration mode (memory, rules, context)
+    SRE: Unified mode for all operations (alerts, device control, memory, rules)
     """
     SRE = "SRE"
-    OPERATOR = "OPERATOR"
