@@ -28,6 +28,7 @@ from actions.signal_receiver import SignalReceiver
 from modes import Mode
 from dedup import AlertDeduplicator
 from memory import MemoryManager
+from learning.rejection_analyzer import RejectionAnalyzer
 
 # Setup logging
 def setup_logging():
@@ -86,6 +87,13 @@ class SREAgent:
         # Memory manager for operator mode
         self.memory = MemoryManager(working_dir=Path.cwd())
 
+        # Learning: Load suppression rules from rejection analysis
+        self.rejection_analyzer = RejectionAnalyzer()
+        self.rejection_analyzer.load_history()
+        self.suppression_rules = self.rejection_analyzer.get_suppression_rules()
+        if self.suppression_rules:
+            logger.info(f"Loaded {len(self.suppression_rules)} learned suppression rules")
+
         # State
         self.plans_dir = Path('data/plans')
         self.history_dir = Path('data/history')
@@ -139,10 +147,52 @@ class SREAgent:
                 continue
         return False
 
+    def _should_suppress(self, evidence: dict) -> bool:
+        """Check if evidence matches learned false positive patterns.
+
+        Uses suppression rules learned from past rejection analysis.
+
+        Args:
+            evidence: Collected evidence dict
+
+        Returns:
+            True if should suppress (matches false positive pattern)
+        """
+        if not self.suppression_rules:
+            return False
+
+        issues = evidence.get('issues', [])
+        docker_data = evidence.get('docker', {})
+        system_data = evidence.get('system', {})
+
+        for rule in self.suppression_rules:
+            # Check network + healthy containers pattern
+            if rule.get('name') == 'network_healthy_containers':
+                # Check if network issue present
+                has_network_issue = any(
+                    'network' in str(issue).lower()
+                    for issue in issues
+                )
+                # Check if all containers healthy
+                unhealthy = docker_data.get('unhealthy_containers', 0)
+                all_healthy = unhealthy == 0
+
+                if has_network_issue and all_healthy:
+                    logger.info(f"Matched suppression rule: {rule['name']} "
+                               f"(learned from {rule.get('occurrences', 0)} rejections)")
+                    return True
+
+        return False
+
     def analyze_and_plan(self, evidence: dict) -> Optional[dict]:
         """Send evidence to Claude for analysis and plan generation."""
         if not evidence.get('issues'):
             logger.info("No issues detected, skipping analysis")
+            return None
+
+        # Check learned suppression rules (self-learning from past rejections)
+        if self._should_suppress(evidence):
+            logger.info("Suppressed by learned false positive pattern")
             return None
 
         # Check for existing pending plan for same issue type
@@ -290,11 +340,8 @@ class SREAgent:
 
             logger.info(f"Processing Signal command: {action} {plan_id or ''}")
 
-            # Mode switching (works from any mode)
-            if action == 'mode_switch':
-                self._handle_mode_switch(cmd)
-            # SRE mode commands
-            elif action == 'approve':
+            # Alert commands
+            if action == 'approve':
                 self._handle_signal_approve(plan_id)
             elif action == 'reject':
                 self._handle_signal_reject(plan_id)
@@ -306,31 +353,30 @@ class SREAgent:
             elif action == 'status':
                 plans = self.list_plans('pending')
                 self.signal_receiver.send_status(plans, mode=Mode.SRE)
+            # Memory commands
+            elif action == 'memory_show':
+                self._handle_memory_show()
+            elif action == 'memory_add':
+                self._handle_memory_add(cmd.get('text', ''))
+            elif action == 'memory_clear':
+                self._handle_memory_clear()
+            # Rules commands
+            elif action == 'rules_list':
+                self._handle_rules_list()
+            elif action == 'rules_show':
+                self._handle_rules_show(cmd.get('name', ''))
+            elif action == 'rules_add':
+                self._handle_rules_add(cmd.get('name', ''), cmd.get('content', ''))
+            # System commands
+            elif action == 'context':
+                self._handle_context()
+            elif action == 'reload':
+                self._handle_reload()
             elif action == 'help':
                 self.signal_receiver.send_help(mode=Mode.SRE)
+            # Natural language chat
             elif action == 'chat':
-                self._handle_signal_chat(cmd.get('text', ''), cmd.get('raw_text', ''))
-            # Operator mode commands
-            elif action == 'operator_memory_show':
-                self._handle_operator_memory_show()
-            elif action == 'operator_memory_add':
-                self._handle_operator_memory_add(cmd.get('text', ''))
-            elif action == 'operator_memory_clear':
-                self._handle_operator_memory_clear()
-            elif action == 'operator_rules_list':
-                self._handle_operator_rules_list()
-            elif action == 'operator_rules_show':
-                self._handle_operator_rules_show(cmd.get('name', ''))
-            elif action == 'operator_rules_add':
-                self._handle_operator_rules_add(cmd.get('name', ''), cmd.get('content', ''))
-            elif action == 'operator_context':
-                self._handle_operator_context()
-            elif action == 'operator_reload':
-                self._handle_operator_reload()
-            elif action == 'operator_help':
-                self._handle_operator_help(cmd.get('topic'))
-            elif action == 'operator_chat':
-                self._handle_operator_chat(cmd.get('text', ''))
+                self._handle_signal_chat(cmd.get('text', ''), cmd.get('raw_text', ''), cmd.get('sender', ''))
 
     def _validate_issue_persists(self, plan: dict) -> tuple:
         """Check if the issue that triggered this plan still exists.
@@ -595,76 +641,50 @@ class SREAgent:
                 mode=Mode.SRE
             )
 
-    # ========== Operator Mode Handlers ==========
+    # ========== Memory & Rules Handlers ==========
 
-    def _handle_mode_switch(self, cmd: dict):
-        """Handle mode switching command."""
-        sender = cmd.get('sender')
-        new_mode = cmd.get('mode')
-
-        self.signal_receiver.set_mode(sender, new_mode)
-        logger.info(f"Mode switched to {new_mode.value} for {sender}")
-
-        if new_mode == Mode.SRE:
-            self.signal_receiver.send_response(
-                "👋 Monitoring mode.\n\n"
-                "Commands: approve, reject, status, ?\n"
-                "Or ask me anything about your system.",
-                mode=Mode.SRE
-            )
-        elif new_mode == Mode.OPERATOR:
-            self.signal_receiver.send_response(
-                "🔧 Configuration mode.\n\n"
-                "Commands:\n"
-                "• memory show/add/clear\n"
-                "• rules list/show/add\n"
-                "• context, reload\n"
-                "• /sre to exit",
-                mode=Mode.OPERATOR
-            )
-
-    def _handle_operator_memory_show(self):
+    def _handle_memory_show(self):
         """Show memory.md contents."""
         content = self.memory.get_memory()
         # Truncate if too long for Signal
         if len(content) > 1500:
             content = content[:1500] + "\n\n... (truncated)"
-        self.signal_receiver.send_response(f"📝 Memory:\n\n{content}", mode=Mode.OPERATOR)
+        self.signal_receiver.send_response(f"📝 Memory:\n\n{content}", mode=Mode.SRE)
 
-    def _handle_operator_memory_add(self, text: str):
+    def _handle_memory_add(self, text: str):
         """Add to memory."""
         if not text:
-            self.signal_receiver.send_response("❌ Usage: memory add <text>", mode=Mode.OPERATOR)
+            self.signal_receiver.send_response("❌ Usage: memory add <text>", mode=Mode.SRE)
             return
 
         if self.memory.add_memory(text):
-            self.signal_receiver.send_response(f"✅ Added to memory:\n{text}", mode=Mode.OPERATOR)
+            self.signal_receiver.send_response(f"✅ Added to memory:\n{text}", mode=Mode.SRE)
         else:
-            self.signal_receiver.send_response("❌ Failed to add to memory", mode=Mode.OPERATOR)
+            self.signal_receiver.send_response("❌ Failed to add to memory", mode=Mode.SRE)
 
-    def _handle_operator_memory_clear(self):
+    def _handle_memory_clear(self):
         """Clear memory."""
         if self.memory.clear_memory():
-            self.signal_receiver.send_response("🗑️ Memory cleared", mode=Mode.OPERATOR)
+            self.signal_receiver.send_response("🗑️ Memory cleared", mode=Mode.SRE)
         else:
-            self.signal_receiver.send_response("❌ Failed to clear memory", mode=Mode.OPERATOR)
+            self.signal_receiver.send_response("❌ Failed to clear memory", mode=Mode.SRE)
 
-    def _handle_operator_rules_list(self):
+    def _handle_rules_list(self):
         """List rule files."""
         rules = self.memory.list_rules()
         if rules:
             self.signal_receiver.send_response(
                 f"📋 Rules ({len(rules)}):\n" +
                 "\n".join(f"• {r}" for r in rules),
-                mode=Mode.OPERATOR
+                mode=Mode.SRE
             )
         else:
-            self.signal_receiver.send_response("📋 No rule files found", mode=Mode.OPERATOR)
+            self.signal_receiver.send_response("📋 No rule files found", mode=Mode.SRE)
 
-    def _handle_operator_rules_show(self, name: str):
+    def _handle_rules_show(self, name: str):
         """Show a rule file."""
         if not name:
-            self.signal_receiver.send_response("❌ Usage: rules show <name>", mode=Mode.OPERATOR)
+            self.signal_receiver.send_response("❌ Usage: rules show <name>", mode=Mode.SRE)
             return
 
         content = self.memory.get_rule(name)
@@ -672,137 +692,113 @@ class SREAgent:
             # Truncate if too long
             if len(content) > 1500:
                 content = content[:1500] + "\n\n... (truncated)"
-            self.signal_receiver.send_response(f"📄 {name}.md:\n\n{content}", mode=Mode.OPERATOR)
+            self.signal_receiver.send_response(f"📄 {name}.md:\n\n{content}", mode=Mode.SRE)
         else:
-            self.signal_receiver.send_response(f"❌ Rule '{name}' not found", mode=Mode.OPERATOR)
+            self.signal_receiver.send_response(f"❌ Rule '{name}' not found", mode=Mode.SRE)
 
-    def _handle_operator_rules_add(self, name: str, content: str):
+    def _handle_rules_add(self, name: str, content: str):
         """Add to a rule file."""
         if not name or not content:
-            self.signal_receiver.send_response("❌ Usage: rules add <name> <content>", mode=Mode.OPERATOR)
+            self.signal_receiver.send_response("❌ Usage: rules add <name> <content>", mode=Mode.SRE)
             return
 
         if self.memory.add_rule(name, content):
-            self.signal_receiver.send_response(f"✅ Added to {name}.md:\n{content}", mode=Mode.OPERATOR)
+            self.signal_receiver.send_response(f"✅ Added to {name}.md:\n{content}", mode=Mode.SRE)
         else:
-            self.signal_receiver.send_response("❌ Failed to add rule", mode=Mode.OPERATOR)
+            self.signal_receiver.send_response("❌ Failed to add rule", mode=Mode.SRE)
 
-    def _handle_operator_context(self):
+    def _handle_context(self):
         """Show loaded context files."""
         files = self.memory.get_context_files()
         if files:
             lines = [f"📂 Context files ({len(files)}):"]
             for path, ftype in files:
                 lines.append(f"• [{ftype}] {path}")
-            self.signal_receiver.send_response("\n".join(lines), mode=Mode.OPERATOR)
+            self.signal_receiver.send_response("\n".join(lines), mode=Mode.SRE)
         else:
-            self.signal_receiver.send_response("📂 No context files loaded", mode=Mode.OPERATOR)
+            self.signal_receiver.send_response("📂 No context files loaded", mode=Mode.SRE)
 
-    def _handle_operator_reload(self):
+    def _handle_reload(self):
         """Reload context files."""
         # Reinitialize memory manager to reload files
         self.memory = MemoryManager(working_dir=Path.cwd())
         files = self.memory.get_context_files()
-        self.signal_receiver.send_response(f"🔄 Reloaded {len(files)} context files", mode=Mode.OPERATOR)
+        self.signal_receiver.send_response(f"🔄 Reloaded {len(files)} context files", mode=Mode.SRE)
 
-    def _handle_operator_help(self, topic: str = None):
-        """Show operator mode help."""
-        if topic == 'memory':
-            self.signal_receiver.send_response(
-                "📝 Memory Commands:\n\n"
-                "• memory show - View learnings\n"
-                "• memory add <text> - Add a learning\n"
-                "• memory clear - Clear all",
-                mode=Mode.OPERATOR
-            )
-        elif topic == 'rules':
-            self.signal_receiver.send_response(
-                "📋 Rules Commands:\n\n"
-                "• rules list - List rule files\n"
-                "• rules show <name> - View a rule\n"
-                "• rules add <name> <content> - Add to rule",
-                mode=Mode.OPERATOR
-            )
-        else:
-            self.signal_receiver.send_response(
-                "🔧 Operator Mode Help\n\n"
-                "Memory:\n"
-                "• memory show - View learnings\n"
-                "• memory add <text> - Add learning\n"
-                "• memory clear - Clear all\n\n"
-                "Rules:\n"
-                "• rules list - List files\n"
-                "• rules show <name> - View rule\n"
-                "• rules add <name> <text> - Add to rule\n\n"
-                "Other:\n"
-                "• context - Show loaded files\n"
-                "• reload - Refresh context\n"
-                "• /sre - Return to SRE mode",
-                mode=Mode.OPERATOR
-            )
+    # ========== Chat Handler ==========
 
-    def _handle_operator_chat(self, message: str):
-        """Process operator message with Claude SDK for natural language config."""
-        from claude_sdk import query_sync
-
-        self.signal_receiver.send_response("🔧 Processing...", mode=Mode.OPERATOR)
-
-        system_prompt = """You are an operator assistant for SRE configuration.
-Keep responses SHORT (under 500 chars) - this is mobile messaging.
-
-You can help with:
-- Viewing/editing memory notes (server-inventory.md, sre-notes.md)
-- Adjusting alert rules and suppression rules
-- Viewing/updating agent configuration
-- Reading any files in the project
-
-You have full access to Read, Write, Bash, Glob, and Grep tools.
-If asked to update a file, just do it - no permission needed.
-Plain text only (no markdown formatting)."""
-
-        try:
-            response = query_sync(message=message, system_prompt=system_prompt)
-            self.signal_receiver.send_response(response, mode=Mode.OPERATOR)
-            logger.info(f"Operator chat: {message[:50]}... -> {response[:50]}...")
-        except Exception as e:
-            logger.error(f"Operator chat error: {e}")
-            self.signal_receiver.send_response(f"Error: {e}", mode=Mode.OPERATOR)
-
-    # ========== End Operator Mode Handlers ==========
-
-    def _handle_signal_chat(self, message: str, raw_text: str = ''):
+    def _handle_signal_chat(self, message: str, raw_text: str = '', sender: str = ''):
         """Process free-form message with Claude SDK (real tool access)."""
+        import os
         from claude_sdk import query_sync
 
         self.signal_receiver.send_response("🤔 Thinking...", mode=Mode.SRE)
+
+        # Load existing session for conversation continuity
+        session_id = self._load_session(sender) if sender else None
 
         # Gather context
         evidence = self.collect_evidence()
         containers = evidence.get('metrics', {}).get('docker', {}).get('containers', []) or []
         unhealthy = [c['name'] for c in containers if c.get('health') == 'unhealthy']
 
-        system_prompt = f"""You are an SRE assistant. The user IS the server admin.
+        # Load HA token for device control
+        ha_token = os.environ.get('HA_TOKEN', '')
 
-FORMATTING (CRITICAL):
-Plain text only. NO markdown (no **, `, #, -).
-Max 1 emoji. Under 300 chars. This is mobile.
+        # Load learned device shortcuts
+        shortcuts_file = self.plans_dir.parent / 'device-shortcuts.json'
+        shortcuts = {}
+        if shortcuts_file.exists():
+            try:
+                with open(shortcuts_file) as f:
+                    shortcuts = json.load(f)
+            except Exception:
+                pass
+        shortcuts_text = "\n".join(f"- {name} = {entity}" for name, entity in shortcuts.items())
 
-CONTEXT:
-Atom server: {len(containers)} containers, {len(unhealthy)} unhealthy
-Memory files: server-inventory.md, sre-notes.md (read for server details)
+        system_prompt = f"""You control home.vives.io Home Assistant. The user is the admin.
+
+CRITICAL: When user asks to control a device, USE THE BASH TOOL IMMEDIATELY to run curl. Do NOT ask questions.
+
+HOME ASSISTANT CONTROL:
+curl -sX POST -H "Authorization: Bearer {ha_token}" -H "Content-Type: application/json" -d '{{"entity_id":"ENTITY_ID"}}' https://home.vives.io/api/services/light/turn_on
+curl -sX POST -H "Authorization: Bearer {ha_token}" -H "Content-Type: application/json" -d '{{"entity_id":"ENTITY_ID"}}' https://home.vives.io/api/services/light/turn_off
+
+LEARNED DEVICE SHORTCUTS:
+{shortcuts_text}
+
+LEARNING NEW DEVICES:
+When you successfully control a NEW device not in shortcuts:
+1. Read ai-sre-agent/data/device-shortcuts.json
+2. Add the new mapping (e.g., "screen": "media_player.living_room_tv")
+3. Write the updated JSON back
+4. Say "Learned: screen = media_player.living_room_tv"
 
 RULES:
-You are FULLY AUTHORIZED on this home network.
-Run ANY command: SSH, nmap, curl, docker, etc.
-NEVER ask permission. JUST DO IT immediately.
-Update memory files when you learn something new.
-Brief factual answers only."""
+1. USE BASH TOOL immediately. Don't describe - just do it.
+2. Use entity_id from LEARNED SHORTCUTS when available.
+3. Plain text response. Max 200 chars. No markdown.
+
+PERMISSION LEVELS:
+AUTO-EXECUTE: Lights, status, sensors
+CONFIRM FIRST: Locks, alarms, docker, rm, SSH"""
 
         try:
-            response, session_id = query_sync(message=message, system_prompt=system_prompt)
+            logger.info(f"Calling Claude SDK with message: {message[:50]}...")
+            logger.info(f"System prompt length: {len(system_prompt)} chars")
+            logger.info(f"Session ID: {session_id}")
+            response, new_session_id = query_sync(
+                message=message,
+                system_prompt=system_prompt,
+                session_id=session_id  # Resume conversation!
+            )
             logger.info(f"Claude SDK response ({len(response)} chars): {response[:100]}...")
             self.signal_receiver.send_response(response, mode=Mode.SRE)
             self._save_chat_history(message, response)
+
+            # Save session for next message
+            if new_session_id and sender:
+                self._save_session(sender, new_session_id)
         except Exception as e:
             logger.error(f"Claude SDK chat failed: {e}")
             self.signal_receiver.send_response(f"Error: {e}", mode=Mode.SRE)
@@ -844,6 +840,32 @@ Brief factual answers only."""
             role = "You" if msg['role'] == 'user' else "Agent"
             lines.append(f"{role}: {msg['content'][:100]}")
         return '\n'.join(lines)
+
+    def _load_session(self, sender: str) -> str:
+        """Load session ID for sender to resume conversation."""
+        sessions_file = self.plans_dir.parent / 'sessions.json'
+        if sessions_file.exists():
+            try:
+                with open(sessions_file) as f:
+                    sessions = json.load(f)
+                return sessions.get(sender)
+            except Exception:
+                pass
+        return None
+
+    def _save_session(self, sender: str, session_id: str):
+        """Save session ID for sender to enable conversation continuity."""
+        sessions_file = self.plans_dir.parent / 'sessions.json'
+        sessions = {}
+        if sessions_file.exists():
+            try:
+                with open(sessions_file) as f:
+                    sessions = json.load(f)
+            except Exception:
+                pass
+        sessions[sender] = session_id
+        with open(sessions_file, 'w') as f:
+            json.dump(sessions, f)
 
     def run_daemon(self):
         """Run as a daemon with periodic checks."""

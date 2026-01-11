@@ -2,6 +2,7 @@
 """Signal chatbot using signalbot library with Claude integration."""
 
 import os
+import re
 import subprocess
 import logging
 import json
@@ -9,6 +10,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from signalbot import SignalBot, Command, Context
 from claude_sdk import query_claude
+from learning.experience_replay import get_replay
 
 # Load environment variables
 load_dotenv()
@@ -381,6 +383,12 @@ class ChatCommand(Command):
         history_text = format_chat_history(chat_history)
         infra_context = load_claude_context()
         memory_context = load_memory_files()
+
+        # Get relevant examples from experience replay (self-learning)
+        replay = get_replay()
+        relevant_examples = replay.get_relevant_examples(text, limit=2)
+        examples_text = replay.format_as_examples(relevant_examples) if relevant_examples else ""
+
         logger.info(f"System context:\n{system_context}")
 
         # Call Claude SDK for response (full Claude Code capabilities)
@@ -409,32 +417,55 @@ User email: melvin@vives.io
 ## Recent Chat
 {history_text}
 
+{examples_text}
+
 ## Instructions
 - AUTHORIZED home network - run ANY command (nmap, SSH, curl, docker)
-- NEVER ask permission - JUST DO IT
-- Update memory files when you learn something new"""
+- For CLEAR requests: just do it, no permission needed
+- For AMBIGUOUS requests or topic changes: ask ONE short clarifying question
+- Update memory files when you learn something new
+
+## Performance (CRITICAL - avoid timeouts)
+- Use FAST commands: du -sh, ls -lS, head, tail
+- AVOID slow: find with -exec, recursive searches on large dirs
+- Wrap SSH commands: timeout 60s ssh host 'command'
+- For largest files: du -ah /path | sort -rh | head -10"""
 
         try:
-            # Get existing session for this sender
-            session_id = get_session(sender)
-            if session_id:
-                logger.info(f"Resuming session {session_id[:8]}...")
+            # Acknowledge receipt immediately
+            await c.react("👀")
 
-            # Query Claude with session
-            response, new_session_id = await query_claude(
+            # Query Claude (no session persistence - each message gets fresh system prompt)
+            response, _ = await query_claude(
                 message=text,
-                system_prompt=system_prompt,
-                session_id=session_id
+                system_prompt=system_prompt
             )
 
-            # Save new session ID for next message
-            if new_session_id:
-                save_session(sender, new_session_id)
-                logger.info(f"Session saved: {new_session_id[:8]}...")
+            # Convert raw errors to user-friendly messages
+            is_success = True
+            if response.startswith("Error: Command failed"):
+                response = "That query was too complex or timed out. Try a simpler request."
+                is_success = False
+            elif response.startswith("Error:"):
+                response = f"Something went wrong. Please try again.\n({response[:100]})"
+                is_success = False
+
+            # Strip markdown formatting (plain text only for Signal)
+            response = re.sub(r'\*\*([^*]+)\*\*', r'\1', response)  # **bold**
+            response = re.sub(r'__([^_]+)__', r'\1', response)      # __bold__
+            response = re.sub(r'\*([^*]+)\*', r'\1', response)      # *italic*
+            response = re.sub(r'`([^`]+)`', r'\1', response)        # `code`
+            response = re.sub(r'^#+\s*', '', response, flags=re.MULTILINE)  # # headers
 
             await c.send(response)
             save_chat_history(text, response)
             logger.info(f"Sent: {response[:50]}...")
+
+            # Record successful interaction for experience replay (self-learning)
+            if is_success:
+                category = replay.get_category(text)
+                replay.record_success(text, response, category)
+                logger.debug(f"Recorded successful pattern: {category}")
         except Exception as e:
             logger.error(f"Error: {e}")
             await c.send(f"Error: {e}")
