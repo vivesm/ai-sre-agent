@@ -36,7 +36,7 @@ async def query_claude(
     """
     # Build options with proper system_prompt parameter
     options = ClaudeAgentOptions(
-        system_prompt=system_prompt if not session_id else None,  # Only for new sessions
+        system_prompt=system_prompt,  # Always pass - contains chat history and instructions
         allowed_tools=["Read", "Write", "Bash", "Glob", "Grep"],
         cwd=WORKING_DIR,
         cli_path=CLAUDE_CLI,

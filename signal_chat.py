@@ -435,11 +435,18 @@ User email: melvin@vives.io
             # Acknowledge receipt immediately
             await c.react("👀")
 
-            # Query Claude (no session persistence - each message gets fresh system prompt)
-            response, _ = await query_claude(
+            # Get session for conversation continuity
+            session_id = get_session(sender)
+
+            response, new_session_id = await query_claude(
                 message=text,
-                system_prompt=system_prompt
+                system_prompt=system_prompt,
+                session_id=session_id
             )
+
+            # Save session for next message
+            if new_session_id:
+                save_session(sender, new_session_id)
 
             # Convert raw errors to user-friendly messages
             is_success = True

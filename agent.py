@@ -29,6 +29,27 @@ from modes import Mode
 from dedup import AlertDeduplicator
 from memory import MemoryManager
 from learning.rejection_analyzer import RejectionAnalyzer
+from learning.doc_generator import DocumentationGenerator
+from actions.github_escalation import GitHubEscalator
+import subprocess
+
+
+def is_signal_chat_running() -> bool:
+    """Check if signal_chat.py is already running and handling messages.
+
+    Prevents duplicate responses when both agent.py and signal_chat.py
+    are running simultaneously.
+    """
+    try:
+        result = subprocess.run(
+            ['pgrep', '-f', 'signal_chat.py'],
+            capture_output=True,
+            timeout=2
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
 
 # Setup logging
 def setup_logging():
@@ -93,6 +114,18 @@ class SREAgent:
         self.suppression_rules = self.rejection_analyzer.get_suppression_rules()
         if self.suppression_rules:
             logger.info(f"Loaded {len(self.suppression_rules)} learned suppression rules")
+
+        # Documentation generator for idle time
+        doc_config = self.config.get('doc_generator', {})
+        self.doc_generator = DocumentationGenerator(
+            notify_enabled=doc_config.get('notify', True)
+        )
+        logger.info("Documentation generator initialized")
+
+        # GitHub escalation for persistent failures
+        self.github_escalator = GitHubEscalator(self.config)
+        if self.github_escalator.enabled:
+            logger.info(f"GitHub escalation enabled for repo: {self.github_escalator.repo}")
 
         # State
         self.plans_dir = Path('data/plans')
@@ -323,7 +356,18 @@ class SREAgent:
         elif all_issues:
             logger.info(f"All {len(all_issues)} issues suppressed (already alerted)")
         else:
-            logger.info("No issues detected")
+            logger.info("No issues detected, running doc generator...")
+            # Use idle time for documentation maintenance
+            try:
+                updates = self.doc_generator.run_idle_cycle(evidence)
+                if updates:
+                    notification = self.doc_generator.format_notification(updates)
+                    self.notifier.send_doc_update(notification)
+                    logger.info(f"Documentation cycle complete: {len(updates)} updates")
+                else:
+                    logger.info("Documentation cycle complete: no updates")
+            except Exception as e:
+                logger.error(f"Documentation generator failed: {e}")
 
         logger.info("Monitoring cycle complete")
 
@@ -374,9 +418,12 @@ class SREAgent:
                 self._handle_reload()
             elif action == 'help':
                 self.signal_receiver.send_help(mode=Mode.SRE)
-            # Natural language chat
+            # Natural language chat - only if signal_chat.py isn't handling it
             elif action == 'chat':
-                self._handle_signal_chat(cmd.get('text', ''), cmd.get('raw_text', ''), cmd.get('sender', ''))
+                if is_signal_chat_running():
+                    logger.debug("Skipping chat - signal_chat.py is handling messages")
+                else:
+                    self._handle_signal_chat(cmd.get('text', ''), cmd.get('raw_text', ''), cmd.get('sender', ''), cmd.get('timestamp'))
 
     def _validate_issue_persists(self, plan: dict) -> tuple:
         """Check if the issue that triggered this plan still exists.
@@ -492,12 +539,41 @@ class SREAgent:
             result = self.execute_plan(target_plan)
             if result.get('success'):
                 self.signal_receiver.send_response(f"🎉 Plan {pid} executed successfully!", mode=Mode.SRE)
+                # Clear any failure counts for this issue
+                failure_id = target_plan.get('summary', pid)[:50]
+                self.github_escalator.clear_failure(failure_id)
             else:
                 self.signal_receiver.send_response(
                     f"❌ Plan {pid} execution failed.\n\n"
                     f"Error: {result.get('error', 'Unknown')}",
                     mode=Mode.SRE
                 )
+                # Record failure for potential GitHub escalation
+                failure_id = target_plan.get('summary', pid)[:50]
+                should_escalate = self.github_escalator.record_failure(
+                    failure_id,
+                    {'plan': target_plan, 'error': result.get('error')}
+                )
+                if should_escalate:
+                    # Auto-create GitHub issue after repeated failures
+                    evidence = self.collect_evidence()
+                    issue_url = self.github_escalator.escalate_failure(
+                        failure_id,
+                        target_plan,
+                        {'error': result.get('error'), 'result': result},
+                        evidence
+                    )
+                    if issue_url:
+                        self.signal_receiver.send_response(
+                            f"📝 Created GitHub issue for tracking:\n{issue_url}",
+                            mode=Mode.SRE
+                        )
+                    else:
+                        self.signal_receiver.send_response(
+                            f"⚠️ This issue has failed {self.github_escalator.failure_threshold}+ times. "
+                            f"Consider creating a GitHub issue manually.",
+                            mode=Mode.SRE
+                        )
         else:
             self.signal_receiver.send_response(f"❌ Failed to approve plan {pid}", mode=Mode.SRE)
 
@@ -727,10 +803,14 @@ class SREAgent:
 
     # ========== Chat Handler ==========
 
-    def _handle_signal_chat(self, message: str, raw_text: str = '', sender: str = ''):
+    def _handle_signal_chat(self, message: str, raw_text: str = '', sender: str = '', msg_timestamp: int = None):
         """Process free-form message with Claude SDK (real tool access)."""
         import os
         from claude_sdk import query_sync
+
+        # Send "thinking" reaction if we have the message timestamp
+        if msg_timestamp:
+            self.signal_receiver.send_reaction('⏳', msg_timestamp)
 
         self.signal_receiver.send_response("🤔 Thinking...", mode=Mode.SRE)
 
@@ -756,32 +836,94 @@ class SREAgent:
                 pass
         shortcuts_text = "\n".join(f"- {name} = {entity}" for name, entity in shortcuts.items())
 
-        system_prompt = f"""You control home.vives.io Home Assistant. The user is the admin.
+        # Load command shortcuts for docker/system commands
+        cmd_shortcuts_file = self.plans_dir.parent / 'command-shortcuts.json'
+        cmd_shortcuts = {}
+        if cmd_shortcuts_file.exists():
+            try:
+                with open(cmd_shortcuts_file) as f:
+                    cmd_shortcuts = json.load(f)
+            except Exception:
+                pass
 
-CRITICAL: When user asks to control a device, USE THE BASH TOOL IMMEDIATELY to run curl. Do NOT ask questions.
+        # Format container shortcuts
+        container_aliases = cmd_shortcuts.get('containers', {})
+        container_text = ", ".join(f"{k}={v}" for k, v in container_aliases.items())
+
+        # Load conversation context for this sender
+        conv_context = self._load_conversation_context(sender) if sender else {}
+        context_text = self._format_conversation_context(conv_context)
+
+        system_prompt = f"""You control home.vives.io Home Assistant and server infrastructure. The user is the admin.
+
+{context_text}
+
+CRITICAL: When user asks to do something, USE THE BASH TOOL IMMEDIATELY. Do NOT ask questions.
+
+DOCKER SHORTCUTS (use these container names):
+{container_text}
+
+DOCKER COMMANDS:
+- "restart X" → docker restart <container>
+- "logs X" or "check X logs" → docker logs --tail 50 <container>
+- "stop X" → docker stop <container>
+- "status" → docker ps --format 'table {{{{.Names}}}}\\t{{{{.Status}}}}'
+
+SYSTEM COMMANDS:
+- "disk" → df -h / /home
+- "memory" or "ram" → free -h
+- "load" → uptime
+- "temp" → cat /sys/class/thermal/thermal_zone*/temp | head -1 | awk '{{print $1/1000"C"}}'
 
 HOME ASSISTANT CONTROL:
 curl -sX POST -H "Authorization: Bearer {ha_token}" -H "Content-Type: application/json" -d '{{"entity_id":"ENTITY_ID"}}' https://home.vives.io/api/services/light/turn_on
 curl -sX POST -H "Authorization: Bearer {ha_token}" -H "Content-Type: application/json" -d '{{"entity_id":"ENTITY_ID"}}' https://home.vives.io/api/services/light/turn_off
 
+WHO'S HOME:
+curl -s 'https://home.vives.io/api/states' -H "Authorization: Bearer {ha_token}" | jq -r '.[] | select(.entity_id | startswith("person.")) | "\\(.attributes.friendly_name): \\(.state)"'
+
 LEARNED DEVICE SHORTCUTS:
 {shortcuts_text}
 
-LEARNING NEW DEVICES:
-When you successfully control a NEW device not in shortcuts:
-1. Read ai-sre-agent/data/device-shortcuts.json
-2. Add the new mapping (e.g., "screen": "media_player.living_room_tv")
-3. Write the updated JSON back
-4. Say "Learned: screen = media_player.living_room_tv"
-
 RULES:
 1. USE BASH TOOL immediately. Don't describe - just do it.
-2. Use entity_id from LEARNED SHORTCUTS when available.
+2. Match container names loosely: "ring" = ring-mqtt, "ha" = homeassistant
 3. Plain text response. Max 200 chars. No markdown.
+4. For docker commands on this server, just run them directly.
 
 PERMISSION LEVELS:
-AUTO-EXECUTE: Lights, status, sensors
-CONFIRM FIRST: Locks, alarms, docker, rm, SSH"""
+AUTO-EXECUTE: Lights, status, sensors, docker logs, docker ps, system info
+CONFIRM FIRST: Locks, alarms, docker restart/stop, rm, SSH to other servers
+
+MULTI-STEP INVESTIGATIONS:
+When investigating an issue, follow the complete chain in ONE response:
+1. Check the immediate symptom (e.g., container status)
+2. Check related components (e.g., dependencies, logs)
+3. Identify root cause
+4. Suggest fix
+
+Example: "why is ring down?"
+- Run: docker ps | grep ring
+- Run: docker logs ring-mqtt --tail 20
+- Run: docker ps | grep mosquitto (ring depends on mqtt)
+- Respond with: status + error from logs + root cause + suggested fix
+
+Do NOT ask "should I check logs?" - just check them.
+Do NOT send multiple messages - gather ALL info first, respond ONCE.
+
+INVESTIGATION CHAINS:
+- Container down → logs → dependencies → fix
+- High memory → top processes → leak check → action
+- Network issue → connectivity → DNS → firewall
+- Slow response → load → disk → recent changes
+
+CONFIDENCE GUIDELINES:
+Before taking action, assess your confidence:
+- HIGH (>80%): User intent is clear, action is safe → Do it immediately
+- MEDIUM (50-80%): Mostly clear but some ambiguity → Do it, explain what you did
+- LOW (<50%): Unclear what user wants → Ask for clarification first
+
+ALWAYS ASK FIRST for destructive actions (delete, rm, stop critical services)."""
 
         try:
             logger.info(f"Calling Claude SDK with message: {message[:50]}...")
@@ -794,14 +936,21 @@ CONFIRM FIRST: Locks, alarms, docker, rm, SSH"""
             )
             logger.info(f"Claude SDK response ({len(response)} chars): {response[:100]}...")
             self.signal_receiver.send_response(response, mode=Mode.SRE)
-            self._save_chat_history(message, response)
+            self._save_chat_history(message, response, sender)
 
             # Save session for next message
             if new_session_id and sender:
                 self._save_session(sender, new_session_id)
+
+            # Send success reaction
+            if msg_timestamp:
+                self.signal_receiver.send_reaction('✅', msg_timestamp)
         except Exception as e:
             logger.error(f"Claude SDK chat failed: {e}")
             self.signal_receiver.send_response(f"Error: {e}", mode=Mode.SRE)
+            # Send error reaction
+            if msg_timestamp:
+                self.signal_receiver.send_reaction('❌', msg_timestamp)
 
     def _load_chat_history(self) -> list:
         """Load recent chat messages for context."""
@@ -816,8 +965,8 @@ CONFIRM FIRST: Locks, alarms, docker, rm, SSH"""
                 pass
         return []
 
-    def _save_chat_history(self, user_msg: str, assistant_msg: str):
-        """Save chat exchange to history."""
+    def _save_chat_history(self, user_msg: str, assistant_msg: str, sender: str = ''):
+        """Save chat exchange to history and update conversation context."""
         history_file = self.plans_dir.parent / 'chat_history.json'
         history = self._load_chat_history()
 
@@ -829,6 +978,10 @@ CONFIRM FIRST: Locks, alarms, docker, rm, SSH"""
 
         with open(history_file, 'w') as f:
             json.dump(history, f)
+
+        # Also update conversation context for this sender
+        if sender:
+            self._save_conversation_context(sender, user_msg, assistant_msg)
 
     def _format_chat_history(self, history: list) -> str:
         """Format chat history for prompt."""
@@ -866,6 +1019,84 @@ CONFIRM FIRST: Locks, alarms, docker, rm, SSH"""
         sessions[sender] = session_id
         with open(sessions_file, 'w') as f:
             json.dump(sessions, f)
+
+    def _load_conversation_context(self, sender: str) -> dict:
+        """Load conversation context for a sender."""
+        context_file = self.plans_dir.parent / 'conversation_context.json'
+        if context_file.exists():
+            try:
+                with open(context_file) as f:
+                    all_context = json.load(f)
+                return all_context.get(sender, {})
+            except Exception:
+                pass
+        return {}
+
+    def _save_conversation_context(self, sender: str, user_msg: str, assistant_msg: str):
+        """Extract and save conversation context for a sender."""
+        context_file = self.plans_dir.parent / 'conversation_context.json'
+
+        # Load existing contexts
+        all_context = {}
+        if context_file.exists():
+            try:
+                with open(context_file) as f:
+                    all_context = json.load(f)
+            except Exception:
+                pass
+
+        # Get or create sender context
+        ctx = all_context.get(sender, {'topics': [], 'entities': [], 'last_action': ''})
+
+        # Extract entities from user message (containers, services, etc.)
+        container_names = ['ring-mqtt', 'ring', 'mosquitto', 'mqtt', 'homeassistant', 'ha',
+                          'scrypted', 'authelia', 'homer', 'portainer', 'homebridge',
+                          'watchtower', 'nocodb', 'immich']
+        msg_lower = user_msg.lower()
+
+        # Find mentioned entities
+        mentioned = [c for c in container_names if c in msg_lower]
+        if mentioned:
+            # Add to entities, keep last 5
+            ctx['entities'] = (mentioned + ctx.get('entities', []))[:5]
+
+        # Extract topics (simple keyword extraction)
+        topic_keywords = ['restart', 'logs', 'status', 'disk', 'memory', 'network',
+                         'home', 'lights', 'who', 'check', 'fix', 'why', 'down', 'slow']
+        topics = [k for k in topic_keywords if k in msg_lower]
+        if topics:
+            ctx['topics'] = (topics + ctx.get('topics', []))[:5]
+
+        # Track last action from assistant response
+        action_keywords = ['restarted', 'checked', 'turned', 'showed', 'found']
+        for kw in action_keywords:
+            if kw in assistant_msg.lower():
+                ctx['last_action'] = assistant_msg[:100]
+                break
+
+        # Update timestamp
+        from datetime import datetime
+        ctx['updated'] = datetime.now().isoformat()
+
+        all_context[sender] = ctx
+        with open(context_file, 'w') as f:
+            json.dump(all_context, f, indent=2)
+
+    def _format_conversation_context(self, ctx: dict) -> str:
+        """Format conversation context for system prompt."""
+        if not ctx:
+            return ""
+
+        lines = ["CONVERSATION CONTEXT:"]
+        if ctx.get('entities'):
+            lines.append(f"Recent entities: {', '.join(ctx['entities'][:3])}")
+        if ctx.get('topics'):
+            lines.append(f"Recent topics: {', '.join(ctx['topics'][:3])}")
+        if ctx.get('last_action'):
+            lines.append(f"Last action: {ctx['last_action'][:50]}...")
+        lines.append("If user says 'it' or 'that', they likely mean the above entities.")
+
+        return '\n'.join(lines)
 
     def run_daemon(self):
         """Run as a daemon with periodic checks."""
